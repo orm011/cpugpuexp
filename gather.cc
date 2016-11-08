@@ -10,9 +10,21 @@
 using namespace std;
 
 
+#pragma omp declare simd
+inline uint32_t xorshift_hash(uint32_t x) {
+    x ^= x >> 12; // a
+    x ^= x << 25; // b
+    x ^= x >> 27; // c
+    return x * UINT32_C(213338717);
+}
+
 void BM_gather_materialize(benchmark::State& state) {
   size_t fact_table_size = state.range(0) >> 2; // convert to # ints
   size_t dim_table_size = state.range(1) >> 2; // convert to # ints
+
+  auto sm = __builtin_popcountl (dim_table_size);
+  assert(sm == 1); // popcount of 1.
+  const auto mask = dim_table_size - 1;
 
   assert(RAND_MAX >= dim_table_size);
   
@@ -21,10 +33,13 @@ void BM_gather_materialize(benchmark::State& state) {
   auto output_column = make_unique<uint32_t[]>(fact_table_size);
 
   // init: need fk to be somewhat random into the whole of dim table.
-  unsigned int sd = 0xabcd;
-  for (size_t i = 0; i < fact_table_size; ++i){
-    fact_table_fk_column[i] = (rand_r(&sd) % dim_table_size);
-  }
+  #pragma omp parallel
+    {
+     #pragma omp for simd
+     for (size_t i = 0; i < fact_table_size; ++i) {
+       fact_table_fk_column[i] = mask & xorshift_hash(i);
+     }
+    }
 
   // need dim to be something easy to compute from position.
   #pragma omp parallel for
@@ -60,13 +75,6 @@ void BM_gather_materialize(benchmark::State& state) {
 }
 
 
-// marsaglia xorshift used (faster than rand_r)
-inline uint32_t xorshift64star(uint64_t* x) {
-    *x ^= *x >> 12; // a
-    *x ^= *x << 25; // b
-    *x ^= *x >> 27; // c
-    return (uint32_t)(*x * UINT32_C(213338717));
-}
 
 void BM_gather_add(benchmark::State& state) {
   size_t fact_table_size = state.range(0) >> 2;
@@ -92,12 +100,11 @@ void BM_gather_add(benchmark::State& state) {
     total = 0;
   #pragma omp parallel
     {
-     uint64_t sd = 0xabcd || omp_get_thread_num();
      
-     #pragma omp for                \
+     #pragma omp for simd                \
        reduction (+: total)
      for (size_t i = 0; i < fact_table_size; ++i) {
-       auto index =  mask & xorshift64star(&sd);
+       auto index =  mask & xorshift_hash(i);
        total += dim_table_column[index];
      }
     }
@@ -115,7 +122,6 @@ void BM_gather_add(benchmark::State& state) {
 }
 
 
-
 #define G <<30
 #define M <<20
 #define K <<10
@@ -123,7 +129,7 @@ BENCHMARK(BM_gather_materialize)
 ->Args({1 G, 4 K}) // fits in L1 cache comfortably...
 ->Args({1 G, (4*32) K}) // only fits in L2 cache
 ->Args({1 G, (4*256) K}) // only fits in L3 cache
-->Args({1 G, 400 M})->Unit(benchmark::kMillisecond); // requires trip to...
+->Args({1 G, (4*64) M})->Unit(benchmark::kMillisecond); // requires trip to...
 
 BENCHMARK(BM_gather_add)
 ->Args({1 G, 4 K}) // fits in L1 cache comfortably...
