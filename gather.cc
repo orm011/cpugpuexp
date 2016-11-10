@@ -129,13 +129,17 @@ BENCHMARK(BM_gather_materialize)
 ->Args({1 G, 4 K}) // fits in L1 cache comfortably...
 ->Args({1 G, (4*32) K}) // only fits in L2 cache
 ->Args({1 G, (4*256) K}) // only fits in L3 cache
-->Args({1 G, (4*64) M})->Unit(benchmark::kMillisecond); // requires trip to...
+->Args({1 G, (4*64) M}) // only fits in L3 cache
+->Args({1 G, (8*64) M})
+->Unit(benchmark::kMillisecond); // requires trip to...
 
 BENCHMARK(BM_gather_add)
 ->Args({1 G, 4 K}) // fits in L1 cache comfortably...
 ->Args({1 G, (4*32) K}) // only fits in L2 cache
 ->Args({1 G, (4*256) K}) // only fits in L3 cache
-->Args({1 G, (4*64) M})->Unit(benchmark::kMillisecond); // requires trip to...
+->Args({1 G, (4*64) M})
+->Args({1 G, (8*64) M})
+->Unit(benchmark::kMillisecond); // requires trip to...
 #undef G
 #undef M
 #undef K
