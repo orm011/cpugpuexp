@@ -6,6 +6,7 @@
 #include <iterator>
 #include <algorithm>
 #include <memory>
+#include "emmintrin.h"
 
 using namespace std;
 
@@ -46,7 +47,7 @@ void BM_gather_materialize(benchmark::State& state) {
   for (size_t i = 0; i < dim_table_size; ++i) {
     dim_table_column[i] = i*5 + 1;
   }
-  
+
   // gather access pattern:
   // reads fact_table_fk column sequentially.
   // writes output_column sequentially. 
@@ -93,20 +94,39 @@ void BM_gather_add(benchmark::State& state) {
   for (size_t i = 0; i < dim_table_size; ++i) {
     dim_table_column[i] = i*5 + 1;
   }
-    
+
+  {
+    int busy_loop = 0;
+    int MAX_ITER = 1<<28; // 0.5 G * ~5 cycles * / 3GHz ~ 0.5 sec pause.
+    while (busy_loop < MAX_ITER){
+      _mm_pause ();
+      _mm_pause ();
+      ++busy_loop;
+    }
+  }
+  
   // accesses a workspace of the size |dim_table_column| in an unpredictable way..
   uint64_t total = 0;
   while (state.KeepRunning()) {
     total = 0;
   #pragma omp parallel
-    {
-     
+    {     
      #pragma omp for simd                \
        reduction (+: total)
      for (size_t i = 0; i < fact_table_size; ++i) {
        auto index =  mask & xorshift_hash(i);
        total += dim_table_column[index];
      }
+    }
+  }
+
+
+  {
+    int busy_loop = 0;
+    int MAX_ITER = 1<<29; // 0.5 G * ~5 cycles * / 3GHz ~ 0.5 sec pause.
+    while (busy_loop < MAX_ITER){
+      _mm_pause ();
+      ++busy_loop;
     }
   }
 
@@ -122,27 +142,27 @@ void BM_gather_add(benchmark::State& state) {
 }
 
 
-#define G <<30
-#define M <<20
-#define K <<10
+const uint64_t G  = 30;
+const uint64_t M  = 20;
+const uint64_t K  = 10;
 BENCHMARK(BM_gather_materialize)
-->Args({1 G, 4 K}) // fits in L1 cache comfortably...
-->Args({1 G, (4*32) K}) // only fits in L2 cache
-->Args({1 G, (4*256) K}) // only fits in L3 cache
-->Args({1 G, (4*64) M}) // only fits in L3 cache
-->Args({1 G, (8*64) M})
+->Args({1 << G, 4 << K}) // fits in L1 cache comfortably...
+->Args({1 << G, (4*32) << K}) // only fits in L2 cache
+->Args({1 << G, (4*256) << K}) // only fits in L3 cache
+->Args({1 << G, 16 << M})  // fits in LLC cache with less room...
+->Args({1 << G, (4*64) << M}) // only fits in L3 cache
+->Args({1 << G, (8*64) << M})
+->Args({1 << G, 1 << G})
 ->Unit(benchmark::kMillisecond); // requires trip to...
 
 BENCHMARK(BM_gather_add)
-->Args({1 G, 4 K}) // fits in L1 cache comfortably...
-->Args({1 G, (4*32) K}) // only fits in L2 cache
-->Args({1 G, (4*256) K}) // only fits in L3 cache
-->Args({1 G, (4*64) M})
-->Args({1 G, (8*64) M})
+->Args({1 << G, 4 << K}) // fits in L1 cache comfortably...
+->Args({1 << G, (4*32) << K}) // fully fits in L2 cache...
+->Args({1 << G, (4*256) << K}) // only fits in L3 cache
+->Args({1 << G, 16 << M})  // fits in LLC cache...
+->Args({1 << G, (4*64) << M})
+->Args({1 << G, (8*64) << M})
+->Args({1 << G, 1 << G})
 ->Unit(benchmark::kMillisecond); // requires trip to...
-#undef G
-#undef M
-#undef K
-
 
 BENCHMARK_MAIN();
