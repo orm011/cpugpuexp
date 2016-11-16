@@ -230,15 +230,16 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
                   uint32_t * __restrict__ output,
                   uint32_t * __restrict__ scatter_mask)
 {
-  // each thread: go over fact while grouping entries in similar working sets in buffers
-  // when some buffer is full, just do lookups and write outputs
-  // when input is done, go over outstanding buffers in order and write outputs
+  const static size_t L2_CACHE_SIZE =  256 << K; // 256KB for L2, with some extra room for the intermediate buffers.
+  const static size_t LLC_CACHE_SIZE = 16 << M; // 20MB for L3, trying not to do lookups within L3.
+  const static size_t THREADS = 8;
+  const static size_t LLC_CACHE_SIZE_PER_THREAD = LLC_CACHE_SIZE/THREADS;
+  
   const static size_t kMaxBufferEntries = 256;
-  const static size_t CACHE_SIZE =  256 << K; // 256KB for L2, with some extra room for the intermediate buffers.
-  const static size_t kNumBuffers = CACHE_SIZE/(2 * kMaxBufferEntries * sizeof(uint32_t) * 2);
+  const static size_t kNumBuffers = LLC_CACHE_SIZE_PER_THREAD/(kMaxBufferEntries * sizeof(uint32_t));
+
   auto max_fanout_per_buffer = dimension_len*sizeof(uint32_t)/kNumBuffers;
-  const static size_t LLC_CACHE_SIZE = 20 << M; // 20MB for L3, trying not to do lookups within L3.
-  assert(max_fanout_per_buffer < LLC_CACHE_SIZE);
+  assert(max_fanout_per_buffer < L2_CACHE_SIZE);
   assert( __builtin_popcountl (kNumBuffers) == 1); // power of two
   
   assert(dimension_len > 0);
@@ -257,21 +258,21 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
   {
   uint32_t positions[kNumBuffers]{};
   uint32_t position_buffer[kNumBuffers][kMaxBufferEntries];
-  uint32_t orig_buffer[kNumBuffers][kMaxBufferEntries];
+  // uint32_t orig_buffer[kNumBuffers][kMaxBufferEntries];
   
   // sanity checks: don't underutilize or exceed the L2 cache for our internal buffering.
-  auto constexpr intermediate_sizes = sizeof(position_buffer) + sizeof(orig_buffer) + sizeof(positions);
-  static_assert(intermediate_sizes < CACHE_SIZE, "cache sizes");
-  static_assert(CACHE_SIZE/2 < intermediate_sizes, "cache sizes");
+  auto constexpr intermediate_sizes = sizeof(position_buffer) + sizeof(positions);
+  static_assert(intermediate_sizes < LLC_CACHE_SIZE_PER_THREAD, "cache sizes");
+  static_assert(LLC_CACHE_SIZE_PER_THREAD/2 < intermediate_sizes, "cache sizes");
 
-  auto flush_buffer = [&positions, &global_output_idx, &position_buffer, &orig_buffer, &dimension, &scatter_mask, &output](uint32_t buffer, uint32_t num_entries){
+  auto flush_buffer = [&positions, &global_output_idx, &position_buffer, &dimension, &scatter_mask, &output](uint32_t buffer, uint32_t num_entries){
       auto out_idx = global_output_idx.fetch_add(num_entries);  
 
       for (size_t buf_idx = 0; buf_idx < num_entries; ++buf_idx) { 
         auto a = position_buffer[buffer][buf_idx];                 
-        auto b = orig_buffer[buffer][buf_idx];          
+        // auto b = orig_buffer[buffer][buf_idx];          
         output[out_idx] = dimension[a];  
-        scatter_mask[out_idx] = b;                     
+        // scatter_mask[out_idx] = b;                     
         out_idx++;                
       }
       
@@ -286,7 +287,7 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
     auto pos = positions[buffer]++;
     
     position_buffer[buffer][pos] = fact[i];
-    orig_buffer[buffer][pos] = i;
+    // orig_buffer[buffer][pos] = i;
 
     // if buffer is full now, do the lookups, and flush buffer
     if (pos + 1 == kMaxBufferEntries) {
@@ -313,6 +314,7 @@ BENCHMARK(BM_gather_materialize)
 ->Args({1 << G, (4*32) << K}) // only fits in L2 cache
 ->Args({1 << G, (4*256) << K}) // only fits in L3 cache
 ->Args({1 << G, 16 << M})  // fits in LLC cache with less room...
+->Args({1 << G, (4*16) << M})
 ->Args({1 << G, (4*64) << M}) // only fits in L3 cache
 ->Args({1 << G, (8*64) << M})
 ->Args({1 << G, 1 << G})
@@ -323,6 +325,7 @@ BENCHMARK(BM_gather_add)
 ->Args({1 << G, (4*32) << K}) // fully fits in L2 cache...
 ->Args({1 << G, (4*256) << K}) // only fits in L3 cache
 ->Args({1 << G, 16 << M})  // fits in LLC cache...
+->Args({1 << G, (4*16) << M})
 ->Args({1 << G, (4*64) << M})
 ->Args({1 << G, (8*64) << M})
 ->Args({1 << G, 1 << G})
@@ -334,6 +337,7 @@ BENCHMARK(BM_gather_buffer)
 ->Args({1 << G, (4*32) << K}) // fully fits in L2 cache...
 ->Args({1 << G, (4*256) << K}) // only fits in L3 cache
 ->Args({1 << G, 16 << M})  // fits in LLC cache...
+->Args({1 << G, (4*16) << M})
 ->Args({1 << G, (4*64) << M})
 ->Args({1 << G, (8*64) << M})
 ->Args({1 << G, 1 << G})
