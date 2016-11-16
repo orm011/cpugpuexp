@@ -147,84 +147,16 @@ void BM_gather_add(benchmark::State& state) {
   }
 }
 
-void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
-                  const uint32_t * __restrict__ dimension, uint32_t dimension_len,
-                  uint32_t * __restrict__ output,
-                  uint32_t * __restrict__ scatter_mask);
-
-void BM_gather_buffer(benchmark::State& state) {
-  size_t fact_table_size = state.range(0) >> 2; // convert to # ints
-  size_t dim_table_size = state.range(1) >> 2; // convert to # ints
-
-  auto sm = __builtin_popcountl (dim_table_size);
-  assert(sm == 1); // popcount of 1.
-  const auto mask = dim_table_size - 1;
-
-  assert(RAND_MAX >= dim_table_size);
-  
-  auto fact_table_fk_column = make_unique<uint32_t[]>(fact_table_size);
-  auto dim_table_column = make_unique<uint32_t[]>(dim_table_size);
-  auto output_column = make_unique<uint32_t[]>(fact_table_size);
-  auto actual_output_column = make_unique<uint32_t[]>(fact_table_size);
-  auto output_column_pos = make_unique<uint32_t[]>(fact_table_size);
-
-  // init: need fk to be somewhat random into the whole of dim table.
-  #pragma omp parallel
-    {
-     #pragma omp for simd
-     for (size_t i = 0; i < fact_table_size; ++i) {
-       fact_table_fk_column[i] = mask & xorshift_hash(i);
-     }
-    }
-
-  // need dim to be something easy to compute from position.
-  #pragma omp parallel for
-  for (size_t i = 0; i < dim_table_size; ++i) {
-    dim_table_column[i] = i*5 + 1;
-  }
-
-  // gather access pattern:
-  // reads fact_table_fk column sequentially.
-  // writes output_column sequentially. 
-  // accesses a workspace of the size |dim_table_column| in a data dependent manne.
-  // time this here...
-  while (state.KeepRunning()) {
-    radix_gather(fact_table_fk_column.get(), fact_table_size,
-                 dim_table_column.get(), dim_table_size,
-                 output_column.get(),
-                 output_column_pos.get());
-    
-  }
-
-  // do a scatter to reorder the output entries
-  #pragma omp parallel for
-  for (size_t i = 0; i < fact_table_size; ++i) {
-    actual_output_column[output_column_pos[i]] = output_column[i];
-  }
-
-  uint32_t res_expected =0 , res_actual = 0;
-#pragma omp parallel for                        \
-  reduction (+: res_expected, res_actual)
-  for (size_t i = 0; i < fact_table_size; ++i) {
-    res_expected += (fact_table_fk_column[i]*5 + 1);
-    res_actual += output_column[i];
-  }
-
-  if (res_actual != res_expected){
-    cerr << "ERROR: failed correctness check." << endl;
-    cerr << res_actual << " vs. "  << res_expected << endl;
-  }
-}
-
-void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
-                  const uint32_t * __restrict__ dimension, uint32_t dimension_len,
-                  uint32_t * __restrict__ output,
-                  uint32_t * __restrict__ scatter_mask)
+void radix_gather(uint32_t input_len,
+                  const uint32_t * __restrict__ dimension,
+                  uint32_t dimension_len,
+                  uint64_t * __restrict__ output,
+                  uint64_t * __restrict__ out_expected)
 {
   // each thread: go over fact while grouping entries in similar working sets in buffers
   // when some buffer is full, just do lookups and write outputs
   // when input is done, go over outstanding buffers in order and write outputs
-  const static size_t kMaxBufferEntries = 256;
+  const static size_t kMaxBufferEntries = 512;
   const static size_t CACHE_SIZE =  256 << K; // 256KB for L2, with some extra room for the intermediate buffers.
   const static size_t kNumBuffers = CACHE_SIZE/(2 * kMaxBufferEntries * sizeof(uint32_t) * 2);
   auto max_fanout_per_buffer = dimension_len*sizeof(uint32_t)/kNumBuffers;
@@ -242,9 +174,12 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
   assert(1 << __builtin_popcount(kRadixMask) == kNumBuffers); 
 
   // shared. 
-  atomic<uint32_t> global_output_idx(0);
-
-  #pragma omp parallel
+  //atomic<uint32_t> global_output_idx(0);
+  uint64_t total = 0;
+  uint64_t expected = 0;
+  
+  #pragma omp parallel \
+    reduction (+: total, expected)
   {
   uint32_t positions[kNumBuffers]{};
   uint32_t position_buffer[kNumBuffers][kMaxBufferEntries];
@@ -255,45 +190,95 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
   static_assert(intermediate_sizes < CACHE_SIZE, "cache sizes");
   static_assert(CACHE_SIZE/2 < intermediate_sizes, "cache sizes");
 
-  auto flush_buffer = [&positions, &global_output_idx, &position_buffer, &orig_buffer, &dimension, &scatter_mask, &output](uint32_t buffer, uint32_t num_entries){
-      auto out_idx = global_output_idx.fetch_add(num_entries);  
-
-      for (size_t buf_idx = 0; buf_idx < num_entries; ++buf_idx) { 
-        auto a = position_buffer[buffer][buf_idx];                 
-        auto b = orig_buffer[buffer][buf_idx];          
-        output[out_idx] = dimension[a];  
-        scatter_mask[out_idx] = b;                     
-        out_idx++;                
-      }
+  auto flush_buffer = [&positions, &position_buffer, &orig_buffer, &dimension](uint32_t buffer, uint32_t num_entries){
+    //auto out_idx = global_output_idx.fetch_add(num_entries);  
+    uint64_t sum = 0;
+    for (size_t buf_idx = 0; buf_idx < num_entries; ++buf_idx) { 
+      auto a = position_buffer[buffer][buf_idx];                 
+      //auto b = orig_buffer[buffer][buf_idx];          
+      sum += dimension[a];  
+      //out_idx++;                
+    }
       
-      positions[buffer] = 0;
-    };
+    positions[buffer] = 0;
+    return sum;
+  };
 
   
-#pragma omp for                                          
+#pragma omp for
   for (size_t i = 0; i < input_len; ++i) {
-    auto buffer = (kRadixMask & fact[i]) >> starting_offset;
+    auto fact_i = mask & xorshift_hash(i);
+    expected += fact_i * 5 + 1;
+    auto buffer = (kRadixMask & fact_i) >> starting_offset;
     assert(buffer < kNumBuffers);
     auto pos = positions[buffer]++;
     
-    position_buffer[buffer][pos] = fact[i];
+    position_buffer[buffer][pos] = fact_i;
     orig_buffer[buffer][pos] = i;
 
     // if buffer is full now, do the lookups, and flush buffer
     if (pos + 1 == kMaxBufferEntries) {
-      flush_buffer(buffer, kMaxBufferEntries);
+      total += flush_buffer(buffer, kMaxBufferEntries);
     }
   }
 
   // flush remaining buffer contents
   for (size_t b = 0; b < kNumBuffers; ++b) {
     if (positions[b] > 0){
-      flush_buffer(b, positions[b]);
+      total += flush_buffer(b, positions[b]);
     }
   }
   
+  } // #pragma omp parallel ends
+
+  *output = total;
+  *out_expected = expected;
+}
+
+void BM_gather_buffer(benchmark::State& state) {
+  size_t fact_table_size = state.range(0) >> 2; // convert to # ints
+  size_t dim_table_size = state.range(1) >> 2; // convert to # ints
+
+  auto sm = __builtin_popcountl (dim_table_size);
+  assert(sm == 1); // popcount of 1.
+
+  assert(RAND_MAX >= dim_table_size);
+  
+  auto dim_table_column = make_unique<uint32_t[]>(dim_table_size);
+  auto output_column = make_unique<uint32_t[]>(fact_table_size);
+
+  // need dim to be something easy to compute from position.
+  #pragma omp parallel for
+  for (size_t i = 0; i < dim_table_size; ++i) {
+    dim_table_column[i] = i*5 + 1;
+  }
+
+  // gather access pattern:
+  // reads fact_table_fk column sequentially.
+  // writes output_column sequentially. 
+  // accesses a workspace of the size |dim_table_column| in a data dependent manne.
+  // time this here...
+  uint64_t res_actual =0;
+  uint64_t res_expected = 0;
+  while (state.KeepRunning()) {
+    radix_gather(fact_table_size, dim_table_column.get(), dim_table_size, &res_actual, &res_expected);
+  }
+
+  if (res_actual != res_expected) {
+    cerr << "ERROR: failed correctness check." << endl;
+    cerr << res_actual << " vs. "  << res_expected << endl;
+  }
+
+  auto expectation = ((uint64_t)fact_table_size/dim_table_size)*(5*((uint64_t)dim_table_size * (dim_table_size + 1))/2 + dim_table_size);
+
+  auto ratio = ((double)res_actual / (double)expectation);
+  auto tolerance = 0.01;
+  if ( ratio - 1.0 < -tolerance ||
+       ratio - 1.0 > tolerance ) {
+      cerr << res_actual << " vs expectation mismmatch =  " << expectation << endl;
   }
 }
+
 
 void BM_gather_buffer_test(benchmark::State& state) {
   BM_gather_buffer(state);
