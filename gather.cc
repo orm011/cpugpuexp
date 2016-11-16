@@ -202,7 +202,7 @@ void BM_gather_buffer(benchmark::State& state) {
     actual_output_column[output_column_pos[i]] = output_column[i];
   }
 
-  uint32_t res_expected =0 , res_actual = 0;
+  uint64_t res_expected =0 , res_actual = 0;
 #pragma omp parallel for                        \
   reduction (+: res_expected, res_actual)
   for (size_t i = 0; i < fact_table_size; ++i) {
@@ -214,6 +214,16 @@ void BM_gather_buffer(benchmark::State& state) {
     cerr << "ERROR: failed correctness check." << endl;
     cerr << res_actual << " vs. "  << res_expected << endl;
   }
+
+  auto expectation = ((uint64_t)fact_table_size/dim_table_size)*(5*((uint64_t)(dim_table_size -1) * dim_table_size)/2 + dim_table_size);
+
+  auto ratio = ((double)res_actual / (double)expectation);
+  auto tolerance = 0.01;
+  if ( ratio - 1.0 < -tolerance ||
+       ratio - 1.0 > tolerance ) {
+      cerr << res_actual << " vs expectation mismmatch =  " << expectation << endl;
+  }
+
 }
 
 void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
