@@ -1,0 +1,114 @@
+CPU cost vs GPU cost.
+
+
+TODO:
+capacity vs their respective cpus/ram
+ratios in # sockets vs # gpus. (what balance is there)
+pcie busses to these gpus.
+cost. vs their respective cpus.
+
+Azure:
+Nvidia Tesla K80 GPUs meant for compute-intensive processes
+Nvidia Tesla M60 and Nvidia Grid GPUs, is oriented around visual workloads.
+They all work in association with Intel E5-2690v3 chips
+
+AWS:
+High Frequency Intel Xeon E5-2686v4 (Broadwell) Processors
+NVIDIA K80 GPUs, each with 2,496 parallel processing cores and 12GiB of GPU memory
+Supports GPUDirect™ (peer-to-peer GPU communication)
+p 2.16xlarge (16 gpus) (64 vcpu) (732 gb ram) (192 gb gpu ram)
+(cpu ram is 4x gpu ram)
+
+Google:
+AMD FirePro S9300 x2. Size/Type: 8GB HBM Bandwidth: 1TB/s (2x 512GB/s).
+Tesla P100: 16 GB or 12 GB 732 GB/s or 549 GB/s.
+Tesla K80: 24 GB of GDDR5 memory. 480 GB/s aggregate memory bandwidth.
+
+Up to 8 GPU dies  to any non-shared core machine whether you’re using an n1-highmem-8 instance with 3 TB of super-fast
+Local SSD or a custom 28 vCPU virtual machine with 180 GB of RAM.
+GPUs will be priced per minute and GPU instances can be up and running within minutes
+
+MapD
+"Using standard analytical queries on the 1.2 billion row NYC taxi
+dataset, we found that a single Google n1-highmem-32 instance
+with 8 attached K80 dies is on average 85 times faster than Impala
+running on a cluster of 6 nodes each with 32 vCPUs"
+
+For a defer and batch we
+Need three constraints to be satisfied:
+
+lower level = LLC/N
+note on patterns:
+* input is read sequentially from RAM.
+* buffer is built randomly across k sets.
+* buffer read sequentially in chunks of size b.
+* dim table (from the perspective of a single thread), is read randomly within a limited fanout area.
+* output is written sequentially to output buffer in chunks of size b.
+
+fanout = |D|/k. this is the max area a single bucket will point to.
+
+bk  < buffer_cache (aka buffer fits in per thread cache). 
+fanout < lookup_cache (aka each buffer batch looks up within a small domain that fits in our share of cache)
+b >> sqrt(fanout) (aka each buffer batch must be long enough to have cache hits assuming we always start with cold misses)
+
+Where does prefetching fit in this situation...
+
+Extra note: what is the effect of streaming the input in / out from memory on this cache work we are doing.
+(eg, vs generate addresses, and then do an aggregate)
+
+Finally, any technique with a reordering of a single column is okay if we only look at that column,
+and the next operation is commutative, if not, then we need to either reorder al columns simultaneously,
+or we need to take a payload along, and potentially materialize it.  Later on we may need to re-order something
+in order to actually do the query, but this cost could be being ommitted from the benchmark... giving
+us better than actual results.
+
+single most important thing to do this week:
+  The main point is to see if there is a good speedup here eg (2-4x).
+     -- 'end to end' test checking shipping of dim table, streaming of address table, seeing if we can beat for dim tables
+     -- in the sweet spot.
+     Start with that:
+     pipelining through the gpu. This seems crucial to be competitive with CPU.
+     eg. if read + write + ship overlap in time, and link is full duplex,
+     then we have 3GB (note the amplification) to read and write to local memory, vs 1GB to ship back and forth.
+     then effectively we have 
+     
+     If first experiment doesn't work out:
+     --Things to keep in mind. In a short microbenchmark that reads input and materializes output, the actual cost of
+     the middle stuff (which we care about) can sometimes be concealed by the read/write overhead.
+         This means for example that ratio algo1/algo2 may be small simply because read and write dominate.
+         This means that things like streaming writes for output can change the ratio...
+
+         In a real pipeline fragment, we would ideally do a few things with the stuff we read before writing
+         an output back. This would mean that if each of those things is somewhat sped up, we would actually
+         get a good fragment speedup, even though each technique separately would not reflect that.
+
+
+    Also: LLC random acces. vs scanning and writing output out:
+     In this case we read 1GB seq. write 1GB seq. and do 256K 4B random lookups into LLC.
+     The LLC lookup case is ~60ms, the read and write is ~60ms. as well. With streaming writes, 40ms vs 60ms.
+     Streaming the 1GB of data to and from a GPU => 83ms. (full duplex), plust a streaming write: 20-40ms.
+     So, we are talking lower bound of 100ms to 120ms if the streaming writes are not that good.
+
+     For a dimension table that fits in 20MB LLC, we get. at most 2ms of non-overlapable transfer time.
+     So there would be really no speedup in this microbenchmark.
+
+     In a microbenchmark were we just generate things and aggregate after, for example.
+     the only time really is 60ms on the ram.
+     For GPU, we would force a streaming which basically means we lost already (even if it is single way) at (80ms)
+
+     For a microbenchmark with random access to more than LLC (eg 500MB).
+     
+     60ms (stream through gpu) -> 100 ms
+     
+     Note: rescanning as a technique forces a materialization of whatever vector it is we are scanning (ie, adds a
+     cost of writing the stream and then reading it for a subsequent scan.
+
+     In a benchmark that starts with reading the input, this cost would be underestimated, because we assume an given
+     column input.  But if the data comes from a pipeline fragment, this would actually be an extra cost....
+
+        
+Secondary things to do sometime:
+ -- basic debug of partition using new insights. ask Vlad about this implementation/run Orestes.
+ -- other datasets. eg. the MapD workload on those datasets. How big are these tables.
+ -- cost comparison.
+ -- does multi gpu change the decision landscape. is it actually low hanging fruit.
