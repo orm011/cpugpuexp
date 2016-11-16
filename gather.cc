@@ -196,13 +196,12 @@ void BM_gather_buffer(benchmark::State& state) {
     
   }
 
-  // do a scatter to reorder the output entries
-  #pragma omp parallel for
-  for (size_t i = 0; i < fact_table_size; ++i) {
-    actual_output_column[output_column_pos[i]] = output_column[i];
-  }
-
-  uint64_t res_expected =0 , res_actual = 0;
+  // do a scatter to reorder the output entries ( to test directly)...
+  // #pragma omp parallel for
+  // for (size_t i = 0; i < fact_table_size; ++i) {
+  //   actual_output_column[output_column_pos[i]] = output_column[i];
+  // }
+  uint64_t res_expected = 0, res_actual = 0;
 #pragma omp parallel for                        \
   reduction (+: res_expected, res_actual)
   for (size_t i = 0; i < fact_table_size; ++i) {
@@ -221,7 +220,7 @@ void BM_gather_buffer(benchmark::State& state) {
   auto tolerance = 0.01;
   if ( ratio - 1.0 < -tolerance ||
        ratio - 1.0 > tolerance ) {
-      cerr << res_actual << " vs expectation mismmatch =  " << expectation << endl;
+    cerr << "ERROR: actual " << res_actual << " vs expectation mismmatch =  " << expectation << endl;
   }
 
 }
