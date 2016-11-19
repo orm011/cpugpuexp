@@ -230,12 +230,12 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
                   uint32_t * __restrict__ output,
                   uint32_t * __restrict__ scatter_mask)
 {
-  const static size_t L2_CACHE_SIZE =  256 << K; // 256KB for L2, with some extra room for the intermediate buffers.
+  const static size_t L2_CACHE_SIZE = 256 << K; // 256KB for L2, with some extra room for the intermediate buffers.
   const static size_t LLC_CACHE_SIZE = 16 << M; // 20MB for L3, trying not to do lookups within L3.
   const static size_t THREADS = 8;
   const static size_t LLC_CACHE_SIZE_PER_THREAD = LLC_CACHE_SIZE/THREADS;
   
-  const static size_t kMaxBufferEntries = 256;
+  const static size_t kMaxBufferEntries = 512;
   const static size_t kNumBuffers = LLC_CACHE_SIZE_PER_THREAD/(kMaxBufferEntries * sizeof(uint32_t));
 
   auto max_fanout_per_buffer = dimension_len*sizeof(uint32_t)/kNumBuffers;
@@ -246,7 +246,7 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
   auto max_dimension_bit = 31 - __builtin_clz(dimension_len);
   auto mask = kNumBuffers - 1;
   auto mask_size = __builtin_popcount(mask);
-  auto starting_offset = max_dimension_bit > mask_size? (max_dimension_bit - mask_size) : 0;
+  auto starting_offset = max_dimension_bit > mask_size ? (max_dimension_bit - mask_size) : 0;
   const static uint32_t kRadixMask = mask << starting_offset;
   
   assert(1 << __builtin_popcount(kRadixMask) == kNumBuffers); 
