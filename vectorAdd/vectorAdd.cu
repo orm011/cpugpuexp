@@ -23,22 +23,44 @@
 #include <cuda_runtime.h>
 
 #include <helper_cuda.h>
+#include <cassert>
+
+inline int xorshift_hash(int x) {
+    x ^= x >> 12; // a
+    x ^= x << 25; // b
+    x ^= x >> 27; // c
+    return ((unsigned int)x) * 213338717U;
+}
+
 /**
  * CUDA Kernel Device code
  *
  * Computes the vector addition of A and B into C. The 3 vectors have the same
  * number of elements numElements.
  */
+// __global__ void
+// vectorAdd(const float *A, const float *B, float *C, int numElements)
+// {
+//     int i = blockDim.x * blockIdx.x + threadIdx.x;
+
+//     if (i < numElements)
+//     {
+//         C[i] = A[i] + B[i];
+//     }
+// }
+
+
 __global__ void
-vectorAdd(const float *A, const float *B, float *C, int numElements)
+vectorGather(const int *index_col, const int *dimension_col, int *output, int idx_len)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
 
-    if (i < numElements)
+    if (i < idx_len)
     {
-        C[i] = A[i] + B[i];
+      output[i] = dimension_col[index_col[i]];
     }
 }
+
 
 /**
  * Host main routine
@@ -50,18 +72,26 @@ main(void)
     cudaError_t err = cudaSuccess;
 
     // Print the vector length to be used, and compute its size
-    int numElements = 50000;
-    size_t size = numElements * sizeof(float);
-    printf("[Vector addition of %d elements]\n", numElements);
+    const int G = 30;
+    const int M = 20;
+    //const int K = 10;
+    
+    size_t idx_size = 1U << G;
+    size_t dim_size = 128U << M;
+    
+    size_t idx_num = idx_size / sizeof(int);
+    size_t dim_num = dim_size / sizeof(int);
+    
+    printf("[Gather of %lu indices into a table of %lu locations]\n", idx_num, dim_num);
 
     // Allocate the host input vector A
-    float *h_A = (float *)malloc(size);
+    int *h_A = (int *)malloc(idx_size);
 
     // Allocate the host input vector B
-    float *h_B = (float *)malloc(size);
+    int *h_B = (int *)malloc(dim_size);
 
     // Allocate the host output vector C
-    float *h_C = (float *)malloc(size);
+    int *h_C = (int *)malloc(idx_size);
 
     // Verify that allocations succeeded
     if (h_A == NULL || h_B == NULL || h_C == NULL)
@@ -70,16 +100,24 @@ main(void)
         exit(EXIT_FAILURE);
     }
 
+    int sm = __builtin_popcountl (dim_num);
+    assert(sm == 1); // popcount of 1.
+    const int mask = dim_num - 1;
+
     // Initialize the host input vectors
-    for (int i = 0; i < numElements; ++i)
+    for (int i = 0; i < idx_num; ++i)
     {
-        h_A[i] = rand()/(float)RAND_MAX;
-        h_B[i] = rand()/(float)RAND_MAX;
+       h_A[i] = xorshift_hash(i) & mask;
+       assert(h_A[i] < dim_num);
+    }
+
+    for (int i = 0; i < dim_num; ++i){
+      h_B[i] = 5*i + 1;
     }
 
     // Allocate the device input vector A
-    float *d_A = NULL;
-    err = cudaMalloc((void **)&d_A, size);
+    int *d_A = NULL;
+    err = cudaMalloc((void **)&d_A, idx_size);
 
     if (err != cudaSuccess)
     {
@@ -88,8 +126,8 @@ main(void)
     }
 
     // Allocate the device input vector B
-    float *d_B = NULL;
-    err = cudaMalloc((void **)&d_B, size);
+    int *d_B = NULL;
+    err = cudaMalloc((void **)&d_B, dim_size);
 
     if (err != cudaSuccess)
     {
@@ -98,8 +136,8 @@ main(void)
     }
 
     // Allocate the device output vector C
-    float *d_C = NULL;
-    err = cudaMalloc((void **)&d_C, size);
+    int *d_C = NULL;
+    err = cudaMalloc((void **)&d_C, idx_size);
 
     if (err != cudaSuccess)
     {
@@ -110,7 +148,7 @@ main(void)
     // Copy the host input vectors A and B in host memory to the device input vectors in
     // device memory
     printf("Copy input data from the host memory to the CUDA device\n");
-    err = cudaMemcpy(d_A, h_A, size, cudaMemcpyHostToDevice);
+    err = cudaMemcpy(d_A, h_A, idx_size, cudaMemcpyHostToDevice);
 
     if (err != cudaSuccess)
     {
@@ -118,7 +156,7 @@ main(void)
         exit(EXIT_FAILURE);
     }
 
-    err = cudaMemcpy(d_B, h_B, size, cudaMemcpyHostToDevice);
+    err = cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice);
 
     if (err != cudaSuccess)
     {
@@ -128,9 +166,9 @@ main(void)
 
     // Launch the Vector Add CUDA Kernel
     int threadsPerBlock = 256;
-    int blocksPerGrid =(numElements + threadsPerBlock - 1) / threadsPerBlock;
+    int blocksPerGrid =(idx_size + threadsPerBlock - 1) / threadsPerBlock;
     printf("CUDA kernel launch with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
-    vectorAdd<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, numElements);
+    vectorGather<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num);
     err = cudaGetLastError();
 
     if (err != cudaSuccess)
@@ -142,7 +180,7 @@ main(void)
     // Copy the device result vector in device memory to the host result vector
     // in host memory.
     printf("Copy output data from the CUDA device to the host memory\n");
-    err = cudaMemcpy(h_C, d_C, size, cudaMemcpyDeviceToHost);
+    err = cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost);
 
     if (err != cudaSuccess)
     {
@@ -151,12 +189,12 @@ main(void)
     }
 
     // Verify that the result vector is correct
-    for (int i = 0; i < numElements; ++i)
+    for (int i = 0; i < idx_num; ++i)
     {
-        if (fabs(h_A[i] + h_B[i] - h_C[i]) > 1e-5)
+      if (h_C[i] != h_A[i]*5+1)
         {
-            fprintf(stderr, "Result verification failed at element %d!\n", i);
-            exit(EXIT_FAILURE);
+          fprintf(stderr, "Result verification failed at element %d!\n", i);
+          exit(EXIT_FAILURE);
         }
     }
 
