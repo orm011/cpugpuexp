@@ -190,7 +190,7 @@ else
       BUILD_TYPE := release
 endif
 
-ALL_CCFLAGS :=
+ALL_CCFLAGS := -std=c++11
 ALL_CCFLAGS += $(NVCCFLAGS)
 ALL_CCFLAGS += $(EXTRA_NVCCFLAGS)
 ALL_CCFLAGS += $(addprefix -Xcompiler ,$(CCFLAGS))
@@ -237,7 +237,7 @@ endif
 # Target rules
 all: build
 
-build: vectorAdd
+build: vectorGather
 
 check.deps:
 ifeq ($(SAMPLE_ENABLED),0)
@@ -247,19 +247,19 @@ else
 endif
 
 
-vectorAdd.o:vectorAdd.cu
+vectorGather.o:vectorGather.cu
 	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
-vectorAdd: vectorAdd.o
+vectorGather: vectorGather.o
 	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
 	$(EXEC) mkdir -p ../../bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)
 	$(EXEC) cp $@ ../../bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)
 
 run: build
-	$(EXEC) ./vectorAdd
+	$(EXEC) ./vectorGather
 
 clean:
-	rm -f vectorAdd vectorAdd.o
-	rm -rf ../../bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)/vectorAdd
+	rm -f vectorGather vectorGather.o
+	rm -rf ../../bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)/vectorGather
 
 clobber: clean

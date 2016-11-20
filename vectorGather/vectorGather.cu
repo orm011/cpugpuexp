@@ -21,7 +21,8 @@
 
 // For the CUDA runtime routines (prefixed with "cuda_")
 #include <cuda_runtime.h>
-
+#include <chrono>
+#include <functional>
 #include <helper_cuda.h>
 #include <cassert>
 
@@ -77,7 +78,7 @@ main(void)
     //const int K = 10;
     
     size_t idx_size = 1U << G;
-    size_t dim_size = 128U << M;
+    size_t dim_size = 256U << M;
     
     size_t idx_num = idx_size / sizeof(int);
     size_t dim_num = dim_size / sizeof(int);
@@ -145,6 +146,16 @@ main(void)
         exit(EXIT_FAILURE);
     }
 
+    auto time_it = [](std::function<void()> fn){
+      auto start = std::chrono::high_resolution_clock::now();
+      fn();
+      auto end   = std::chrono::high_resolution_clock::now();
+      auto diff  =
+        std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+      return (uint32_t)diff.count();
+    };
+
+    
     // Copy the host input vectors A and B in host memory to the device input vectors in
     // device memory
     printf("Copy input data from the host memory to the CUDA device\n");
@@ -156,7 +167,11 @@ main(void)
         exit(EXIT_FAILURE);
     }
 
-    err = cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice);
+    auto copy_dim = [&](){
+      err = cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice);
+    };
+    
+    auto copy_dim_millis = time_it(copy_dim);
 
     if (err != cudaSuccess)
     {
@@ -168,7 +183,21 @@ main(void)
     int threadsPerBlock = 256;
     int blocksPerGrid =(idx_size + threadsPerBlock - 1) / threadsPerBlock;
     printf("CUDA kernel launch with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
-    vectorGather<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num);
+
+
+    auto kernel_exec = [&](){
+      vectorGather<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num);
+      err = cudaDeviceSynchronize();
+    };
+    
+    uint32_t kernel_millis = time_it(kernel_exec);
+
+    if (err != cudaSuccess)
+    {
+        fprintf(stderr, "Failed to launch vectorAdd kernel (error code %s)!\n", cudaGetErrorString(err));
+        exit(EXIT_FAILURE);
+    }
+        
     err = cudaGetLastError();
 
     if (err != cudaSuccess)
@@ -177,10 +206,15 @@ main(void)
         exit(EXIT_FAILURE);
     }
 
+    
     // Copy the device result vector in device memory to the host result vector
     // in host memory.
     printf("Copy output data from the CUDA device to the host memory\n");
-    err = cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost);
+    auto copy_back = [&](){
+      err = cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost);
+    };
+
+    auto copy_millis = time_it(copy_back);
 
     if (err != cudaSuccess)
     {
@@ -198,7 +232,8 @@ main(void)
         }
     }
 
-    printf("Test PASSED\n");
+    printf("Test PASSED. copy dim (ms): %u. kernel time (ms): %u. copy back time (ms): %u\n",
+           copy_dim_millis, kernel_millis, copy_millis);
 
     // Free device global memory
     err = cudaFree(d_A);
