@@ -52,7 +52,7 @@ inline int xorshift_hash(int x) {
 // }
 
 __global__ void
-vectorGather(const int *index_col, const int *dimension_col, int *output, int idx_len)
+vectorGather(const int * __restrict__ index_col, const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -63,32 +63,64 @@ vectorGather(const int *index_col, const int *dimension_col, int *output, int id
 }
 
 
+// used as control
 __global__ void
-vectorGatherNoScan(const int *dimension_col, int *output, int idx_len, int mask)
+vectorCopy(const int * __restrict__ index_col, const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len)
+{
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (i < idx_len)
+    {
+      output[i] = index_col[i];
+    }
+}
+
+
+__global__ void
+vectorGatherNoInput(const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len, int mask)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
 
     if (i < idx_len)
     {
       auto x = i;
-      x ^= x >> 12; // a
-      x ^= x << 25; // b
-      x ^= x >> 27; // c
-      x = ((unsigned int)x) * 213338717U;
-      auto idx = x & mask;
+      auto a = x ^ (x >> 12); 
+      auto b = a ^ (a << 25);
+      auto c = b ^ (b >> 27);
+      
+      auto d  = ((unsigned int)c) * 213338717U;
+      auto idx = d & mask;
       output[i] = dimension_col[idx];
     }
 }
+
+// basically CPU + write, to see how much is probably random.
+__global__ void
+vectorCopyNoInput(const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len, int mask)
+{
+    int i = blockDim.x * blockIdx.x + threadIdx.x;
+
+    if (i < idx_len)
+    {
+      auto x = i;
+      auto a = x ^ (x >> 12); 
+      auto b = a ^ (a << 25);
+      auto c = b ^ (b >> 27);
+      
+      auto d  = ((unsigned int)c) * 213338717U;
+      auto idx = d & mask;
+      output[i] = idx;
+    }
+}
+
 
 #define cudaCheckErrors($call)                     \
     do { \
       cudaError_t err = cudaGetLastError(); \
       if (err != cudaSuccess){\
-        fprintf(stderr, "Error already set before call: (%s at %s:%d)\n", \
+        fprintf(stderr, "WARNING: Error was already set before call: (%s at %s:%d)\n", \
                 cudaGetErrorString(err),                       \
                 __FILE__, __LINE__); \
-        fprintf(stderr, "*** FAILED - ABORTING\n"); \
-        exit(1); \
       }\
       $call;                                  \
       err = cudaGetLastError(); \
@@ -128,9 +160,10 @@ main(void)
     const int G = 30;
     const int M = 20;
     //const int K = 10;
+
     
     size_t idx_size = 1U << G;
-    size_t dim_size = 256U << M;
+    size_t dim_size = 512U << M;
     
     size_t idx_num = idx_size / sizeof(int);
     size_t dim_num = dim_size / sizeof(int);
@@ -143,13 +176,8 @@ main(void)
 
     // Allocate the host input vector B
     int *h_B = nullptr;
-    cudaMallocManaged(&h_B, dim_size);
-    cudaCheckErrors();
+    cudaCheckErrors(cudaMallocManaged(&h_B, dim_size));
     
-    // Allocate the host output vector C
-    int *h_C = nullptr;
-    cudaCheckErrors(cudaMallocManaged(&h_C, idx_size));
-
     int sm = __builtin_popcountl (dim_num);
     assert(sm == 1); // popcount of 1.
     const int mask = dim_num - 1;
@@ -165,10 +193,9 @@ main(void)
       h_B[i] = 5*i + 1;
     }
 
-
     // Allocate the device input vector A
     int *d_A = NULL;
-    cudaCheckErrors(cudaMalloc((void **)&d_A, idx_size));
+    cudaCheckErrors(cudaMalloc(&d_A, idx_size));
 
     // Allocate the device input vector B
     int *d_B = NULL;
@@ -178,7 +205,6 @@ main(void)
     int *d_C = NULL;
     cudaCheckErrors(cudaMalloc((void **)&d_C, idx_size));
 
-
     // Copy the host input vectors A and B in host memory to the device input vectors in
     // device memory
     printf("Copy idx from the host memory to the CUDA device\n");
@@ -186,20 +212,27 @@ main(void)
     cudaCheckErrors(cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice));
 
     using namespace std::chrono;
-    const int threadsPerBlock = 256; // try tuning this... no?
-    const int blocksPerGrid = (idx_size + threadsPerBlock - 1) / threadsPerBlock;
+    const int threadsPerBlock = 256; // tried tuning. 
+    const int blocksPerGrid = (idx_size + threadsPerBlock - 1) / threadsPerBlock; 
     printf("CUDA kernel launch with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
 
-    // Launch the Vector Add CUDA Kernel
-    auto start = high_resolution_clock::now();    
-    vectorGather<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num);
-    cudaCheckErrors(cudaDeviceSynchronize());
-    auto end   = high_resolution_clock::now();
-    auto diff = duration_cast<milliseconds>(end - start).count();
-    cudaCheckErrors();
-    
+    {
+      auto start = high_resolution_clock::now();    
+      //vectorCopy<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num);
+      //vectorCopyNoInput<<<blocksPerGrid, threadsPerBlock>>>(d_B, d_C, idx_num, mask);
+      vectorGatherNoInput<<<blocksPerGrid, threadsPerBlock>>>(d_B, d_C, idx_num, mask);
+      cudaCheckErrors(cudaDeviceSynchronize());
+      auto end   = high_resolution_clock::now();
+      auto diff = duration_cast<milliseconds>(end - start).count();
+      cudaCheckErrors();
+      printf("kernel runtime: %ld ms\n", diff);
+    }
+
+
+    // Allocate the host output vector C for checking.
+    int *h_C = nullptr;
+    cudaCheckErrors(cudaMallocHost(&h_C, idx_size));
     cudaCheckErrors(cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost));
-    printf("kernel runtime: %ld ms\n", diff);
     
     // Verify that the result vector is correct
     for (int i = 0; i < idx_num; ++i)
