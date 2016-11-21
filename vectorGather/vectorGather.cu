@@ -82,11 +82,19 @@ vectorGatherNoScan(const int *dimension_col, int *output, int idx_len, int mask)
 
 #define cudaCheckErrors($call)                     \
     do { \
+      cudaError_t err = cudaGetLastError(); \
+      if (err != cudaSuccess){\
+        fprintf(stderr, "Error already set before call: (%s at %s:%d)\n", \
+                cudaGetErrorString(err),                       \
+                __FILE__, __LINE__); \
+        fprintf(stderr, "*** FAILED - ABORTING\n"); \
+        exit(1); \
+      }\
       $call;                                  \
-      cudaError_t __err = cudaGetLastError(); \
-      if (__err != cudaSuccess) { \
+      err = cudaGetLastError(); \
+      if (err != cudaSuccess) { \
         fprintf(stderr, "Fatal error: (%s at %s:%d)\n", \
-                cudaGetErrorString(__err), \
+                cudaGetErrorString(err),                \
                 __FILE__, __LINE__); \
         fprintf(stderr, "*** FAILED - ABORTING\n"); \
         exit(1); \
@@ -100,21 +108,22 @@ vectorGatherNoScan(const int *dimension_col, int *output, int idx_len, int mask)
 int
 main(void)
 {
+  printf("FYI:\ncuda cpuDeviceId: %d\n", cudaCpuDeviceId);
   auto dev = 0;
-  cudaSetDevice(dev);
+  cudaCheckErrors(cudaSetDevice(dev));
   cudaDeviceProp deviceProp;
   cudaCheckErrors(cudaGetDeviceProperties(&deviceProp, dev));
+
+  printf("some device %d properties:\n",dev);
   printf("concurrent kernels %d\n",deviceProp.concurrentKernels);
   printf("device overlap %d\n",deviceProp.deviceOverlap);
   printf("max threads per block %d\n",deviceProp.maxThreadsPerBlock);
-  printf("max threads per block %d\n",deviceProp.maxThreadsPerBlock);
+  printf("warp size %d\n",deviceProp.warpSize);
+  printf("regs per block %d\n",deviceProp.regsPerBlock);
   
   // TODO: enable this in order to try mapped memory (vs streaming)
   // cudaSetDeviceFlags(cudaDeviceMapHost);
   
-    // Error code to check return values for CUDA calls
-    cudaError_t err = cudaSuccess;
-
     // Print the vector length to be used, and compute its size
     const int G = 30;
     const int M = 20;
@@ -140,15 +149,6 @@ main(void)
     // Allocate the host output vector C
     int *h_C = nullptr;
     cudaCheckErrors(cudaMallocManaged(&h_C, idx_size));
-    // this call fails for with invalid device for some unknown reason...
-    // cudaCheckErrors(cudaMemAdvise(h_C, idx_size, cudaMemAdviseSetPreferredLocation, dev));
-
-    // Verify that allocations succeeded
-    if (h_A == NULL || h_B == NULL || h_C == NULL)
-    {
-        fprintf(stderr, "Failed to allocate host vectors!\n");
-        exit(EXIT_FAILURE);
-    }
 
     int sm = __builtin_popcountl (dim_num);
     assert(sm == 1); // popcount of 1.
@@ -165,98 +165,42 @@ main(void)
       h_B[i] = 5*i + 1;
     }
 
-    cudaMemAdvise(h_A, idx_size, cudaMemAdviseSetReadMostly, 0);
-    cudaCheckErrors();
-    cudaMemAdvise(h_B, dim_size, cudaMemAdviseSetReadMostly, 0);
-    cudaCheckErrors();
 
-    // // Allocate the device input vector A
-    // int *d_A = NULL;
-    // err = cudaMalloc((void **)&d_A, idx_size);
+    // Allocate the device input vector A
+    int *d_A = NULL;
+    cudaCheckErrors(cudaMalloc((void **)&d_A, idx_size));
 
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to allocate device vector A (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // }
+    // Allocate the device input vector B
+    int *d_B = NULL;
+    cudaCheckErrors(cudaMalloc((void **)&d_B, dim_size));
 
-    // // Allocate the device input vector B
-    // int *d_B = NULL;
-    // err = cudaMalloc((void **)&d_B, dim_size);
+    // Allocate the device output vector C
+    int *d_C = NULL;
+    cudaCheckErrors(cudaMalloc((void **)&d_C, idx_size));
 
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to allocate device vector B (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // }
 
-    // // // Allocate the device output vector C
-    // // int *d_C = NULL;
-    // // err = cudaMalloc((void **)&d_C, idx_size);
-
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to allocate device vector C (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // }
-
-    // // Copy the host input vectors A and B in host memory to the device input vectors in
-    // // device memory
-    // printf("Copy idx from the host memory to the CUDA device\n");
-    // err = cudaMemcpy(d_A, h_A, idx_size, cudaMemcpyHostToDevice);
-
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to copy vector A from host to device (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // } 
+    // Copy the host input vectors A and B in host memory to the device input vectors in
+    // device memory
+    printf("Copy idx from the host memory to the CUDA device\n");
+    cudaCheckErrors(cudaMemcpy(d_A, h_A, idx_size, cudaMemcpyHostToDevice));
+    cudaCheckErrors(cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice));
 
     using namespace std::chrono;
-
-    
-    // err = cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice);
-
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to copy vector B from host to device (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // }
-    printf("FYI, cuda cpuDeviceId: %d\n", cudaCpuDeviceId);
     const int threadsPerBlock = 256; // try tuning this... no?
     const int blocksPerGrid = (idx_size + threadsPerBlock - 1) / threadsPerBlock;
     printf("CUDA kernel launch with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
 
     // Launch the Vector Add CUDA Kernel
-    auto start = high_resolution_clock::now();
-    
-    cudaMemPrefetchAsync(h_B, dim_size, dev);     
-    cudaMemPrefetchAsync(h_A, idx_size, dev);     
-    vectorGather<<<blocksPerGrid, threadsPerBlock>>>(h_A, h_B, h_C, idx_num);
-    cudaMemPrefetchAsync(h_C, idx_size, cudaCpuDeviceId);
-    err = cudaDeviceSynchronize();
-
+    auto start = high_resolution_clock::now();    
+    vectorGather<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num);
+    cudaCheckErrors(cudaDeviceSynchronize());
     auto end   = high_resolution_clock::now();
     auto diff = duration_cast<milliseconds>(end - start).count();
-
+    cudaCheckErrors();
+    
+    cudaCheckErrors(cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost));
     printf("kernel runtime: %ld ms\n", diff);
     
-    if (err != cudaSuccess)
-    {
-        fprintf(stderr, "Failed to launch vectorAdd kernel (error code %s)!\n", cudaGetErrorString(err));
-        exit(EXIT_FAILURE);
-    }
-        
-    // // Copy the device result vector in device memory to the host result vector
-    // // in host memory.
-    // printf("Copy output data from the CUDA device to the host memory\n");
-    // err = cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost);
-
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to copy vector C from device to host (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // }
-
     // Verify that the result vector is correct
     for (int i = 0; i < idx_num; ++i)
     {
@@ -267,39 +211,7 @@ main(void)
         }
     }
 
-    printf("Test PASSED.");
-
-    // // Free device global memory
-    // err = cudaFree(d_A);
-
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to free device vector A (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // }
-
-    // err = cudaFree(d_B);
-
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to free device vector B (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // }
-
-    // err = cudaFree(d_C);
-
-    // if (err != cudaSuccess)
-    // {
-    //     fprintf(stderr, "Failed to free device vector C (error code %s)!\n", cudaGetErrorString(err));
-    //     exit(EXIT_FAILURE);
-    // }
-
-    // Free host memory
-    cudaFree(h_A);
-    cudaFree(h_B);
-    cudaFree(h_C);
-
-    printf("Done\n");
+    printf("Test PASSED.\n");
     return 0;
 }
 
