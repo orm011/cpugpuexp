@@ -126,6 +126,8 @@ void BM(benchmark::State& state){
     kernel(fact_table_fk_column.get(), dim_table_column.get(), output_column.get(), fact_table_size, dim_table_size);
   }
 
+  state.SetItemsProcessed(int64_t(state.iterations())*int64_t(fact_table_size));
+  
   if (variant == OnlyMat){
     state.SetBytesProcessed(int64_t(state.iterations()) *
                             int64_t(fact_table_size*sizeof(int32_t) * 2));
