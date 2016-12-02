@@ -237,7 +237,7 @@ endif
 # Target rules
 all: build
 
-build: vectorGather
+build: gpuGather
 
 check.deps:
 ifeq ($(SAMPLE_ENABLED),0)
@@ -247,19 +247,19 @@ else
 endif
 
 
-vectorGather.o:vectorGather.cu
+gpuGather.o:gpuGather.cu
 	$(EXEC) $(NVCC) $(INCLUDES) $(ALL_CCFLAGS) $(GENCODE_FLAGS) -o $@ -c $<
 
-vectorGather: vectorGather.o
+gpuGather: gpuGather.o
 	$(EXEC) $(NVCC) $(ALL_LDFLAGS) $(GENCODE_FLAGS) -o $@ $+ $(LIBRARIES)
 	$(EXEC) mkdir -p ../../bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)
 	$(EXEC) cp $@ ../../bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)
 
 run: build
-	$(EXEC) ./vectorGather
+	$(EXEC) ./gpuGather
 
 clean:
-	rm -f vectorGather vectorGather.o
-	rm -rf ../../bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)/vectorGather
+	rm -f gpuGather gpuGather.o
+	rm -rf ../../bin/$(TARGET_ARCH)/$(TARGET_OS)/$(BUILD_TYPE)/gpuGather
 
 clobber: clean
