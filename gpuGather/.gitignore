@@ -1,2 +1,2 @@
-vectorGather.o
-vectorGather
+*.o
+*.bin
