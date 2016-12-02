@@ -11,11 +11,9 @@
 
 using namespace std;
 
-
-const uint64_t G  = 30;
-const uint64_t M  = 20;
-const uint64_t K  = 10;
-
+const int G  = 30;
+const int M  = 20;
+const int K  = 10;
 
 #pragma omp declare simd
 inline uint32_t xorshift_hash(uint32_t x) {
@@ -25,126 +23,146 @@ inline uint32_t xorshift_hash(uint32_t x) {
     return x * UINT32_C(213338717);
 }
 
-void BM_gather_materialize(benchmark::State& state) {
-  size_t fact_table_size = state.range(0) >> 2; // convert to # ints
-  size_t dim_table_size = state.range(1) >> 2; // convert to # ints
+enum Variant {
+  Mat = 1,
+  NoMat,
+  OnlyMat,
+  WriteOnly
+};
 
+template <Variant variant>
+void cpuGather(const int* __restrict__ fact_table,
+               const int* __restrict__ dim_table,
+               int* __restrict__ output_table,
+               const int64_t idx_len,
+               const int64_t idx_domain) {
+  const auto mask = idx_domain -1;
+
+  switch (variant){
+  case Mat:{
+    #pragma omp parallel for
+    for (int64_t i = 0; i < idx_len; ++i) {
+      output_table[i] = dim_table[fact_table[i]];
+    }
+
+    break;
+  }
+  case NoMat:{
+    uint64_t total = 0;
+    total = 0;
+    #pragma omp parallel
+    {     
+     #pragma omp for simd                \
+       reduction (+: total)
+     for (int64_t i = 0; i < idx_len; ++i) {
+       auto index =  mask & xorshift_hash(i);
+       total += dim_table[index];
+     }
+    }
+
+    ((uint64_t*)output_table)[0] = total;
+    break;
+  }
+ case OnlyMat: {
+   #pragma omp parallel for simd
+    for (int64_t i = 0; i < idx_len; ++i){
+      output_table[i] = 5*fact_table[i] + 1;
+    }
+
+    break;
+  }
+ case WriteOnly:{
+    #pragma omp parallel for simd
+    for (int64_t i = 0; i < idx_len; ++i){
+      auto index = mask & xorshift_hash(i);
+      output_table[i] = 5*index + 1;
+    }
+
+    break;
+ }
+  default:{
+   assert(false && "unknown variant");
+  }
+  }
+}
+
+using KernelT = void(const int* __restrict__ fact_table,
+               const int* __restrict__ dim_table,
+               int* __restrict__ output_table,
+               int64_t idx_len,
+               int64_t idx_domain);
+
+template <KernelT kernel, Variant variant>
+void BM(benchmark::State& state){
+  int64_t fact_table_size = state.range(0) >> 2; // convert to # ints
+  //fprintf(stderr, "before: %d, %d\n", state.range(0), state.range(1));
+  int64_t dim_table_size = state.range(1) >> 2; // convert to # ints
+  //fprintf(stderr, "fact table size (int): %ld.  dim table size (int): %ld\n", fact_table_size, dim_table_size);
   auto sm = __builtin_popcountl (dim_table_size);
   assert(sm == 1); // popcount of 1.
   const auto mask = dim_table_size - 1;
 
   assert(RAND_MAX >= dim_table_size);
-  
-  auto fact_table_fk_column = make_unique<uint32_t[]>(fact_table_size);
-  auto dim_table_column = make_unique<uint32_t[]>(dim_table_size);
-  auto output_column = make_unique<uint32_t[]>(fact_table_size);
+  auto fact_table_fk_column = make_unique<int32_t[]>(fact_table_size);
+  auto dim_table_column = make_unique<int32_t[]>(dim_table_size);
+  auto output_column = make_unique<int32_t[]>(fact_table_size);
 
   // init: need fk to be somewhat random into the whole of dim table.
   #pragma omp parallel
     {
      #pragma omp for simd
-     for (size_t i = 0; i < fact_table_size; ++i) {
+      for (int64_t i = 0; i < fact_table_size; ++i) {
        fact_table_fk_column[i] = mask & xorshift_hash(i);
      }
     }
 
-  // need dim to be something easy to compute from position.
+  // make dim to be something easy to compute from position so we can verify results
   #pragma omp parallel for
-  for (size_t i = 0; i < dim_table_size; ++i) {
+  for (int64_t i = 0; i < dim_table_size; ++i) {
     dim_table_column[i] = i*5 + 1;
   }
 
-  // gather access pattern:
-  // reads fact_table_fk column sequentially.
-  // writes output_column sequentially. 
-  // accesses a workspace of the size |dim_table_column| in a data dependent manne.
-  // time this here...
-  while (state.KeepRunning()) {    
-    #pragma omp parallel for
-    for (size_t i = 0; i < fact_table_size; ++i) {
-      output_column[i] = dim_table_column[fact_table_fk_column[i]];
-    }
-    
-  }
-
-  uint32_t res_expected =0 , res_actual = 0;
-  #pragma omp parallel for \
-    reduction (+: res_expected, res_actual)
-  for (size_t i = 0; i < fact_table_size; ++i) {
-    res_expected += (fact_table_fk_column[i]*5 + 1);
-    res_actual += output_column[i];
-  }
-
-  if (res_actual != res_expected){
-    cerr << "ERROR: failed correctness check." << endl;
-    cerr << res_actual << " vs. "  << res_expected << endl;
-  }
-}
-
-
-
-void BM_gather_add(benchmark::State& state) {
-  size_t fact_table_size = state.range(0) >> 2;
-  size_t dim_table_size = state.range(1) >> 2; // convert to # ints
-      
-  auto sm = __builtin_popcountl (dim_table_size);
-  assert(sm == 1); // popcount of 1.
-  const auto mask = dim_table_size - 1;
-
-  assert(RAND_MAX >= dim_table_size);
-  
-  auto dim_table_column = make_unique<uint32_t[]>(dim_table_size);
-
-  // need dim to be something easy to compute from position.
-  #pragma omp parallel for
-  for (size_t i = 0; i < dim_table_size; ++i) {
-    dim_table_column[i] = i*5 + 1;
-  }
-
-  {
-    int busy_loop = 0;
-    int MAX_ITER = 1<<28; // 0.5 G * ~5 cycles * / 3GHz ~ 0.5 sec pause.
-    while (busy_loop < MAX_ITER){
-      _mm_pause ();
-      _mm_pause ();
-      ++busy_loop;
-    }
-  }
-  
-  // accesses a workspace of the size |dim_table_column| in an unpredictable way..
-  uint64_t total = 0;
   while (state.KeepRunning()) {
-    total = 0;
-  #pragma omp parallel
-    {     
-     #pragma omp for simd                \
-       reduction (+: total)
-     for (size_t i = 0; i < fact_table_size; ++i) {
-       auto index =  mask & xorshift_hash(i);
-       total += dim_table_column[index];
-     }
+    kernel(fact_table_fk_column.get(), dim_table_column.get(), output_column.get(), fact_table_size, dim_table_size);
+  }
+
+  // verify results according to variant
+    switch (variant) {
+    case Mat:
+    case OnlyMat:
+    case WriteOnly: {
+      uint32_t res_expected =0 , res_actual = 0;
+
+#pragma omp parallel for                        \
+  reduction (+: res_expected, res_actual)
+      for (int64_t i = 0; i < fact_table_size; ++i) {
+        res_expected += (fact_table_fk_column[i]*5 + 1);
+        res_actual += output_column[i];
+      }
+
+      if (res_actual != res_expected){
+        cerr << "ERROR: failed correctness check." << endl;
+        cerr << res_actual << " vs. "  << res_expected << endl;
+      }
+
+      break;
     }
-  }
+    case NoMat:{
+      auto total = ((uint64_t*)output_column.get())[0];
+      auto expectation = ((uint64_t)fact_table_size/dim_table_size)*(5*((uint64_t)dim_table_size * (dim_table_size + 1))/2 + dim_table_size);
 
+      auto ratio = ((double)total / (double)expectation);
+      auto tolerance = 0.01;
+      if ( ratio - 1.0 < -tolerance ||
+           ratio - 1.0 > tolerance ) {
+        cerr << total << " vs expectation mismmatch =  " << expectation << endl;
+      }
 
-  {
-    int busy_loop = 0;
-    int MAX_ITER = 1<<29; // 0.5 G * ~5 cycles * / 3GHz ~ 0.5 sec pause.
-    while (busy_loop < MAX_ITER){
-      _mm_pause ();
-      ++busy_loop;
+      break;
     }
-  }
-
-  auto expectation = ((uint64_t)fact_table_size/dim_table_size)*(5*((uint64_t)dim_table_size * (dim_table_size + 1))/2 + dim_table_size);
-
-
-  auto ratio = ((double)total / (double)expectation);
-  auto tolerance = 0.01;
-  if ( ratio - 1.0 < -tolerance ||
-       ratio - 1.0 > tolerance ) {
-      cerr << total << " vs expectation mismmatch =  " << expectation << endl;
-  }
+    default:
+      assert(false && "No verification available for variant");
+    }
 }
 
 void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
@@ -262,8 +280,8 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
   
   // sanity checks: don't underutilize or exceed the L2 cache for our internal buffering.
   auto constexpr intermediate_sizes = sizeof(position_buffer) + sizeof(positions);
-  static_assert(intermediate_sizes < LLC_CACHE_SIZE_PER_THREAD, "cache sizes");
-  static_assert(LLC_CACHE_SIZE_PER_THREAD/2 < intermediate_sizes, "cache sizes");
+  static_assert(true || intermediate_sizes < LLC_CACHE_SIZE_PER_THREAD, "cache sizes");
+  static_assert(true || LLC_CACHE_SIZE_PER_THREAD/2 < intermediate_sizes, "cache sizes");
 
   auto flush_buffer = [&positions, &global_output_idx, &position_buffer, &dimension, &scatter_mask, &output](uint32_t buffer, uint32_t num_entries){
       auto out_idx = global_output_idx.fetch_add(num_entries);  
@@ -279,8 +297,7 @@ void radix_gather(const uint32_t * __restrict__ fact, uint32_t input_len,
       positions[buffer] = 0;
     };
 
-  
-#pragma omp for                                          
+  #pragma omp for                                          
   for (size_t i = 0; i < input_len; ++i) {
     auto buffer = (kRadixMask & fact[i]) >> starting_offset;
     assert(buffer < kNumBuffers);
@@ -309,39 +326,27 @@ void BM_gather_buffer_test(benchmark::State& state) {
   BM_gather_buffer(state);
 }
 
-BENCHMARK(BM_gather_materialize)
-->Args({1 << G, 4 << K}) // fits in L1 cache comfortably...
-->Args({1 << G, (4*32) << K}) // only fits in L2 cache
-->Args({1 << G, (4*256) << K}) // only fits in L3 cache
-->Args({1 << G, 16 << M})  // fits in LLC cache with less room...
-->Args({1 << G, (4*16) << M})
-->Args({1 << G, (4*64) << M}) // only fits in L3 cache
-->Args({1 << G, (8*64) << M})
-->Args({1 << G, 1 << G})
-->Unit(benchmark::kMillisecond); // requires trip to...
 
-BENCHMARK(BM_gather_add)
-->Args({1 << G, 4 << K}) // fits in L1 cache comfortably...
-->Args({1 << G, (4*32) << K}) // fully fits in L2 cache...
-->Args({1 << G, (4*256) << K}) // only fits in L3 cache
-->Args({1 << G, 16 << M})  // fits in LLC cache...
-->Args({1 << G, (4*16) << M})
-->Args({1 << G, (4*64) << M})
-->Args({1 << G, (8*64) << M})
-->Args({1 << G, 1 << G})
-->Unit(benchmark::kMillisecond); // requires trip to...
+// make sure kernel and validation variants match each
+// other
+#define BENCHVAR($bm, $kertemplate, $variant) \
+  BENCHMARK_TEMPLATE($bm, $kertemplate<$variant>, $variant)
 
+BENCHVAR(BM, cpuGather, Mat)->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
+->Unit(benchmark::kMillisecond); 
 
-BENCHMARK(BM_gather_buffer)
-->Args({1 << G, 4 << K}) // fits in L1 cache comfortably...
-->Args({1 << G, (4*32) << K}) // fully fits in L2 cache...
-->Args({1 << G, (4*256) << K}) // only fits in L3 cache
-->Args({1 << G, 16 << M})  // fits in LLC cache...
-->Args({1 << G, (4*16) << M})
-->Args({1 << G, (4*64) << M})
-->Args({1 << G, (8*64) << M})
-->Args({1 << G, 1 << G})
-->Unit(benchmark::kMillisecond); // requires trip to...
+BENCHVAR(BM, cpuGather, NoMat)->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
+->Unit(benchmark::kMillisecond); 
+
+BENCHVAR(BM, cpuGather, OnlyMat)->RangeMultiplier(2)
+->Args({1<<G, 1<<K})->Args({1<<G, 1<<G})
+->Unit(benchmark::kMillisecond); 
+
+// BENCHVAR(BM, cpuGather, WriteOnly)->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {1 << K, 2 << K}})
+// ->Unit(benchmark::kMillisecond); 
 
 BENCHMARK(BM_gather_buffer_test)->Args({64 << K, 64 << K});
 
