@@ -44,11 +44,6 @@ inline int xorshift_hash(int x) {
     return ((unsigned int)x) * 213338717U;
 }
 
-enum DoVerify {
-  VERIFY,
-  NO_VERIFY
-};
-
 /**
  * CUDA Kernel Device code
  *
@@ -216,13 +211,32 @@ void GPU_BM(benchmark::State& state)
     // Allocate the device output vector C
     int *d_C = NULL;
     cudaCheckErrors(cudaMalloc((void **)&d_C, idx_size));
-
     
-    const int threadsPerBlock = 256; // tried tuning. 
+    const int threadsPerBlock = 256; // tried tuning occupancy already good.
     const int blocksPerGrid = (idx_size + threadsPerBlock - 1) / threadsPerBlock;
+    fprintf(stderr, "NB. threads per block = %d. num blocks = %d. blocks per sm = %d\n", threadsPerBlock, blocksPerGrid, blocksPerGrid/24);
+    
     cudaCheckErrors(cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice));
     cudaCheckErrors(cudaMemcpy(d_A, h_A, idx_size, cudaMemcpyHostToDevice));
 
+    KernelT* kernel;
+    switch (variant){
+    case Mat:
+      kernel=gpuMat;
+      break;
+    case OnlyMat:
+      kernel=gpuOnlyMat;
+      break;
+    case OnlyWrite:
+      kernel=gpuOnlyWrite;
+      break;
+    case NoMat:
+      kernel=gpuNoMat;
+      break;
+    default:
+      assert(false && "unknown variant");
+    }
+    
     while (state.KeepRunning())
     {
       kernel<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num, dim_num);
@@ -239,10 +253,8 @@ void GPU_BM(benchmark::State& state)
       {
         if (h_C[i] != h_A[i]*5+1)
           {
-            fprintf(stdout, "Result verification first failed at element %d!\n", i);
+            fprintf(stdout, "Result verification first failed at element %d!. has: %d. expected: %d\n", i, h_C[i], h_A[i]*5 + 1);
             break;
-            //exit(0);
-            //exit(EXIT_FAILURE);
           }
       }
 
