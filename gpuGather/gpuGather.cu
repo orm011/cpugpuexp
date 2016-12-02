@@ -44,6 +44,11 @@ inline int xorshift_hash(int x) {
     return ((unsigned int)x) * 213338717U;
 }
 
+const int kDefaultTpB = 4*32*8; 
+// aka.1024. worked slightly better.
+// it means each of the 4 exec units has 8 threads it can try to schedule
+// and can hide latency up to 8x of
+
 /**
  * CUDA Kernel Device code
  *
@@ -79,7 +84,6 @@ gpuMat(const int * __restrict__ index_col, const int *__restrict__ dimension_col
       output[i] = dimension_col[index_col[i]];
     }
 }
-
 
 // used as control
 __global__ void
@@ -153,7 +157,7 @@ gpuOnlyWrite(const int* __restrict__ , const int *__restrict__ dimension_col, in
 
 
 using KernelT = void(const int *, const int *, int *, int, int);
-template <Variant variant>
+template <Variant variant, int ThreadsPerBlock>
 void GPU_BM(benchmark::State& state)
 {
   static_assert(variant < MAXVARIANT, "invalid variant");
@@ -212,7 +216,7 @@ void GPU_BM(benchmark::State& state)
     int *d_C = NULL;
     cudaCheckErrors(cudaMalloc((void **)&d_C, idx_size));
     
-    const int threadsPerBlock = 256; // tried tuning occupancy already good.
+    const int threadsPerBlock = ThreadsPerBlock;
     const int blocksPerGrid = (idx_size + threadsPerBlock - 1) / threadsPerBlock;
     fprintf(stderr, "NB. threads per block = %d. num blocks = %d. blocks per sm = %d\n", threadsPerBlock, blocksPerGrid, blocksPerGrid/24);
     
@@ -243,6 +247,11 @@ void GPU_BM(benchmark::State& state)
       cudaDeviceSynchronize();
     }
 
+    if (variant == OnlyMat){
+      state.SetBytesProcessed(int64_t(state.iterations()) *
+                              int64_t(idx_size * 2));
+    }
+    
     // Allocate the host output vector C for checking.
     int *h_C = nullptr;
     cudaCheckErrors(cudaMallocHost(&h_C, idx_size));
@@ -268,21 +277,21 @@ void GPU_BM(benchmark::State& state)
 }
 
 
-BENCHMARK_TEMPLATE(GPU_BM, Mat)
+BENCHMARK_TEMPLATE(GPU_BM, Mat, kDefaultTpB)
 ->RangeMultiplier(2)
 ->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
 ->Unit(benchmark::kMillisecond); 
 
-BENCHMARK_TEMPLATE(GPU_BM, NoMat) // actually does write output for now..
+BENCHMARK_TEMPLATE(GPU_BM, NoMat, kDefaultTpB) // actually does write output for now..
 ->RangeMultiplier(2)
 ->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
-->Unit(benchmark::kMillisecond); 
+->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, OnlyMat)  // dim should be irrelevant
+BENCHMARK_TEMPLATE(GPU_BM, OnlyMat, kDefaultTpB)  // dim should be irrelevant
 ->Args({1 << G, 1 <<K})->Args({1<<G, 1<<G})
 ->Unit(benchmark::kMillisecond); 
 
-BENCHMARK_TEMPLATE(GPU_BM, OnlyWrite) // dim should be irrelevant
+BENCHMARK_TEMPLATE(GPU_BM, OnlyWrite, kDefaultTpB) // dim should be irrelevant
 ->Args({1 << G, 1 <<K})->Args({1<<G, 1<<G})
 ->Unit(benchmark::kMillisecond); 
 
