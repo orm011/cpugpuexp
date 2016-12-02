@@ -247,6 +247,8 @@ void GPU_BM(benchmark::State& state)
       cudaDeviceSynchronize();
     }
 
+    state.SetItemsProcessed(int64_t(state.iterations())*int64_t(idx_num));
+    
     if (variant == OnlyMat){
       state.SetBytesProcessed(int64_t(state.iterations()) *
                               int64_t(idx_size * 2));
