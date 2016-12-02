@@ -66,8 +66,16 @@ enum DoVerify {
 //     }
 // }
 
+enum Variant {
+  Mat,
+  NoMat,
+  OnlyMat,
+  OnlyWrite,
+  MAXVARIANT // do not use.
+};
+
 __global__ void
-vectorGather(const int * __restrict__ index_col, const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len, int idx_domain)
+gpuMat(const int * __restrict__ index_col, const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len, int idx_domain)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -80,19 +88,19 @@ vectorGather(const int * __restrict__ index_col, const int *__restrict__ dimensi
 
 // used as control
 __global__ void
-vectorCopy(const int * __restrict__ index_col, const int *__restrict__, int * __restrict__ output, int idx_len, int idx_domain)
+gpuOnlyMat(const int * __restrict__ index_col, const int *__restrict__, int * __restrict__ output, int idx_len, int idx_domain)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
 
     if (i < idx_len)
     {
-      output[i] = index_col[i];
+      output[i] = 5*index_col[i] + 1;
     }
 }
 
 
 __global__ void
-vectorGatherNoInput(const int *__restrict__ , const int * __restrict__ dimension_col, int * __restrict__ output, int idx_len, int idx_domain)
+gpuNoMat(const int *__restrict__ , const int * __restrict__ dimension_col, int * __restrict__ output, int idx_len, int idx_domain)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
     const auto mask = idx_domain - 1;
@@ -112,10 +120,10 @@ vectorGatherNoInput(const int *__restrict__ , const int * __restrict__ dimension
 
 // basically CPU + write, to see how much is probably random.
 __global__ void
-vectorCopyNoInput(const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len, int mask)
+gpuOnlyWrite(const int* __restrict__ , const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len, int idx_domain)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
-
+    const auto mask = idx_domain - 1;
     if (i < idx_len)
     {
       auto x = i;
@@ -125,10 +133,9 @@ vectorCopyNoInput(const int *__restrict__ dimension_col, int * __restrict__ outp
       
       auto d  = ((unsigned int)c) * 213338717U;
       auto idx = d & mask;
-      output[i] = idx;
+      output[i] = 5*idx +1;
     }
 }
-
 
 #define cudaCheckErrors($call)                     \
     do { \
@@ -150,10 +157,11 @@ vectorCopyNoInput(const int *__restrict__ dimension_col, int * __restrict__ outp
     } while (0)
 
 
-//using kernel_t = void(const int *, const int *, int *, int, int);
-template <typename Kernel>
-void benchmark_base(benchmark::State& state, Kernel kernel, DoVerify verify_correct)
+using KernelT = void(const int *, const int *, int *, int, int);
+template <Variant variant>
+void GPU_BM(benchmark::State& state)
 {
+  static_assert(variant < MAXVARIANT, "invalid variant");
   //cerr << "running bench again" << endl;
   //printf("FYI:\ncuda cpuDeviceId: %d\n", cudaCpuDeviceId);
   int64_t idx_size = state.range(0);
@@ -209,18 +217,9 @@ void benchmark_base(benchmark::State& state, Kernel kernel, DoVerify verify_corr
     int *d_C = NULL;
     cudaCheckErrors(cudaMalloc((void **)&d_C, idx_size));
 
+    
     const int threadsPerBlock = 256; // tried tuning. 
     const int blocksPerGrid = (idx_size + threadsPerBlock - 1) / threadsPerBlock;
-    // cudaStream_t streams[kNumStreams];
-    // for (int i = 0; i < kNumStreams; ++i) {
-    //   cudaStreamCreate(&streams[i]);
-    // }
-    // auto part_num = idx_num/kNumStreams;
-    // auto part_sz = idx_size/kNumStreams;
-    
-    // Copy the host input vectors A and B in host memory to the device input vectors in device memory
-    // printf("Copy idx from the host memory to the CUDA device\n");
-    // printf("CUDA kernel launch with %d blocks of %d threads over %d streams\n", blocksPerGrid, threadsPerBlock, kNumStreams);
     cudaCheckErrors(cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice));
     cudaCheckErrors(cudaMemcpy(d_A, h_A, idx_size, cudaMemcpyHostToDevice));
 
@@ -230,27 +229,22 @@ void benchmark_base(benchmark::State& state, Kernel kernel, DoVerify verify_corr
       cudaDeviceSynchronize();
     }
 
-    //vectorCopyNoInput<<<blocksPerGrid, threadsPerBlock>>>(d_B, d_C, idx_num, mask);
-    //vectorGatherNoInput<<<blocksPerGrid, threadsPerBlock>>>(d_B, d_C, idx_num, mask);
-
     // Allocate the host output vector C for checking.
     int *h_C = nullptr;
     cudaCheckErrors(cudaMallocHost(&h_C, idx_size));
     cudaCheckErrors(cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost));
     
     // Verify that the result vector is correct
-    if (verify_correct == VERIFY){
-      for (int i = 0; i < idx_num; ++i)
-        {
-          if (h_C[i] != h_A[i]*5+1)
-            {
-              fprintf(stdout, "Result verification first failed at element %d!\n", i);
-              break;
-              //exit(0);
-              //exit(EXIT_FAILURE);
-            }
-        }
-    }
+    for (int i = 0; i < idx_num; ++i)
+      {
+        if (h_C[i] != h_A[i]*5+1)
+          {
+            fprintf(stdout, "Result verification first failed at element %d!\n", i);
+            break;
+            //exit(0);
+            //exit(EXIT_FAILURE);
+          }
+      }
 
     cudaCheckErrors(cudaFreeHost(h_A));
     cudaCheckErrors(cudaFreeHost(h_B));
@@ -262,14 +256,22 @@ void benchmark_base(benchmark::State& state, Kernel kernel, DoVerify verify_corr
 }
 
 
-
-BENCHMARK_CAPTURE(benchmark_base, vectorGather, vectorGather, VERIFY)
+BENCHMARK_TEMPLATE(GPU_BM, Mat)
 ->RangeMultiplier(2)
 ->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
 ->Unit(benchmark::kMillisecond); 
 
-BENCHMARK_CAPTURE(benchmark_base, vectorCopy, vectorCopy, NO_VERIFY) // the dim table is irrelevant here
-->Args({1 << G, 4}) 
+BENCHMARK_TEMPLATE(GPU_BM, NoMat) // actually does write output for now..
+->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
+->Unit(benchmark::kMillisecond); 
+
+BENCHMARK_TEMPLATE(GPU_BM, OnlyMat)  // dim should be irrelevant
+->Args({1 << G, 1 <<K})->Args({1<<G, 1<<G})
+->Unit(benchmark::kMillisecond); 
+
+BENCHMARK_TEMPLATE(GPU_BM, OnlyWrite) // dim should be irrelevant
+->Args({1 << G, 1 <<K})->Args({1<<G, 1<<G})
 ->Unit(benchmark::kMillisecond); 
 
 BENCHMARK_MAIN();
