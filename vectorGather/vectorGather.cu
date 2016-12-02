@@ -18,6 +18,7 @@
  */
 
 #include <stdio.h>
+#include <benchmark/benchmark.h>
 
 // For the CUDA runtime routines (prefixed with "cuda_")
 #include <cuda_runtime.h>
@@ -25,6 +26,16 @@
 #include <functional>
 #include <helper_cuda.h>
 #include <cassert>
+#include <iostream>
+
+using namespace std;
+
+// TODO: enable this in order to try mapped memory (vs streaming)
+// cudaSetDeviceFlags(cudaDeviceMapHost);
+// Print the vector length to be used, and compute its size
+const int G = 30;
+//const int M = 20;
+const int K = 10;
 
 inline int xorshift_hash(int x) {
     x ^= x >> 12; // a
@@ -33,6 +44,10 @@ inline int xorshift_hash(int x) {
     return ((unsigned int)x) * 213338717U;
 }
 
+enum DoVerify {
+  VERIFY,
+  NO_VERIFY
+};
 
 /**
  * CUDA Kernel Device code
@@ -52,7 +67,7 @@ inline int xorshift_hash(int x) {
 // }
 
 __global__ void
-vectorGather(const int * __restrict__ index_col, const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len)
+vectorGather(const int * __restrict__ index_col, const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len, int idx_domain)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -65,7 +80,7 @@ vectorGather(const int * __restrict__ index_col, const int *__restrict__ dimensi
 
 // used as control
 __global__ void
-vectorCopy(const int * __restrict__ index_col, const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len)
+vectorCopy(const int * __restrict__ index_col, const int *__restrict__, int * __restrict__ output, int idx_len, int idx_domain)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
 
@@ -77,10 +92,11 @@ vectorCopy(const int * __restrict__ index_col, const int *__restrict__ dimension
 
 
 __global__ void
-vectorGatherNoInput(const int *__restrict__ dimension_col, int * __restrict__ output, int idx_len, int mask)
+vectorGatherNoInput(const int *__restrict__ , const int * __restrict__ dimension_col, int * __restrict__ output, int idx_len, int idx_domain)
 {
     int i = blockDim.x * blockIdx.x + threadIdx.x;
-
+    const auto mask = idx_domain - 1;
+    
     if (i < idx_len)
     {
       auto x = i;
@@ -134,49 +150,37 @@ vectorCopyNoInput(const int *__restrict__ dimension_col, int * __restrict__ outp
     } while (0)
 
 
-/**
- * Host main routine
- */
-int
-main(void)
+//using kernel_t = void(const int *, const int *, int *, int, int);
+template <typename Kernel>
+void benchmark_base(benchmark::State& state, Kernel kernel, DoVerify verify_correct)
 {
-  printf("FYI:\ncuda cpuDeviceId: %d\n", cudaCpuDeviceId);
-  auto dev = 0;
-  cudaCheckErrors(cudaSetDevice(dev));
-  cudaDeviceProp deviceProp;
-  cudaCheckErrors(cudaGetDeviceProperties(&deviceProp, dev));
+  //cerr << "running bench again" << endl;
+  //printf("FYI:\ncuda cpuDeviceId: %d\n", cudaCpuDeviceId);
+  int64_t idx_size = state.range(0);
+  int64_t dim_size = state.range(1);
+  int64_t idx_num = idx_size / sizeof(int);
+  int64_t dim_num = dim_size / sizeof(int);
 
-  printf("some device %d properties:\n",dev);
-  printf("concurrent kernels %d\n",deviceProp.concurrentKernels);
-  printf("device overlap %d\n",deviceProp.deviceOverlap);
-  printf("max threads per block %d\n",deviceProp.maxThreadsPerBlock);
-  printf("warp size %d\n",deviceProp.warpSize);
-  printf("regs per block %d\n",deviceProp.regsPerBlock);
-  
-  // TODO: enable this in order to try mapped memory (vs streaming)
-  // cudaSetDeviceFlags(cudaDeviceMapHost);
-  
-    // Print the vector length to be used, and compute its size
-    const int G = 30;
-    const int M = 20;
-    //const int K = 10;
+  //auto dev = 0;
+  //cudaCheckErrors(cudaSetDevice(dev));
+  //cudaDeviceProp deviceProp;
+  //cudaCheckErrors(cudaGetDeviceProperties(&deviceProp, dev));
 
-    
-    size_t idx_size = 1U << G;
-    size_t dim_size = 512U << M;
-    
-    size_t idx_num = idx_size / sizeof(int);
-    size_t dim_num = dim_size / sizeof(int);
-    
-    printf("[Gather of %lu indices into a table of %lu locations]\n", idx_num, dim_num);
+  // printf("some device %d properties:\n",dev);
+  // printf("concurrent kernels %d\n",deviceProp.concurrentKernels);
+  // printf("device overlap %d\n",deviceProp.deviceOverlap);
+  // printf("max threads per block %d\n",deviceProp.maxThreadsPerBlock);
+  // printf("warp size %d\n",deviceProp.warpSize);
+  // printf("regs per block %d\n",deviceProp.regsPerBlock);
+  // printf("[Gather of %lu indices into a table of %lu locations]\n", idx_num, dim_num);
 
     // Allocate the host input vector A
     int *h_A = nullptr;
-    cudaCheckErrors(cudaMallocManaged(&h_A, idx_size));
+    cudaCheckErrors(cudaMallocHost(&h_A, idx_size));
 
     // Allocate the host input vector B
     int *h_B = nullptr;
-    cudaCheckErrors(cudaMallocManaged(&h_B, dim_size));
+    cudaCheckErrors(cudaMallocHost(&h_B, dim_size));
     
     int sm = __builtin_popcountl (dim_num);
     assert(sm == 1); // popcount of 1.
@@ -205,29 +209,29 @@ main(void)
     int *d_C = NULL;
     cudaCheckErrors(cudaMalloc((void **)&d_C, idx_size));
 
-    // Copy the host input vectors A and B in host memory to the device input vectors in
-    // device memory
-    printf("Copy idx from the host memory to the CUDA device\n");
-    cudaCheckErrors(cudaMemcpy(d_A, h_A, idx_size, cudaMemcpyHostToDevice));
-    cudaCheckErrors(cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice));
-
-    using namespace std::chrono;
     const int threadsPerBlock = 256; // tried tuning. 
-    const int blocksPerGrid = (idx_size + threadsPerBlock - 1) / threadsPerBlock; 
-    printf("CUDA kernel launch with %d blocks of %d threads\n", blocksPerGrid, threadsPerBlock);
+    const int blocksPerGrid = (idx_size + threadsPerBlock - 1) / threadsPerBlock;
+    // cudaStream_t streams[kNumStreams];
+    // for (int i = 0; i < kNumStreams; ++i) {
+    //   cudaStreamCreate(&streams[i]);
+    // }
+    // auto part_num = idx_num/kNumStreams;
+    // auto part_sz = idx_size/kNumStreams;
+    
+    // Copy the host input vectors A and B in host memory to the device input vectors in device memory
+    // printf("Copy idx from the host memory to the CUDA device\n");
+    // printf("CUDA kernel launch with %d blocks of %d threads over %d streams\n", blocksPerGrid, threadsPerBlock, kNumStreams);
+    cudaCheckErrors(cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice));
+    cudaCheckErrors(cudaMemcpy(d_A, h_A, idx_size, cudaMemcpyHostToDevice));
 
+    while (state.KeepRunning())
     {
-      auto start = high_resolution_clock::now();    
-      vectorCopy<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num);
-      //vectorCopyNoInput<<<blocksPerGrid, threadsPerBlock>>>(d_B, d_C, idx_num, mask);
-      //vectorGatherNoInput<<<blocksPerGrid, threadsPerBlock>>>(d_B, d_C, idx_num, mask);
-      cudaCheckErrors(cudaDeviceSynchronize());
-      auto end   = high_resolution_clock::now();
-      auto diff = duration_cast<milliseconds>(end - start).count();
-      cudaCheckErrors();
-      printf("kernel runtime: %ld ms\n", diff);
+      kernel<<<blocksPerGrid, threadsPerBlock>>>(d_A, d_B, d_C, idx_num, dim_num);
+      cudaDeviceSynchronize();
     }
 
+    //vectorCopyNoInput<<<blocksPerGrid, threadsPerBlock>>>(d_B, d_C, idx_num, mask);
+    //vectorGatherNoInput<<<blocksPerGrid, threadsPerBlock>>>(d_B, d_C, idx_num, mask);
 
     // Allocate the host output vector C for checking.
     int *h_C = nullptr;
@@ -235,17 +239,37 @@ main(void)
     cudaCheckErrors(cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost));
     
     // Verify that the result vector is correct
-    for (int i = 0; i < idx_num; ++i)
-    {
-      if (h_C[i] != h_A[i]*5+1)
+    if (verify_correct == VERIFY){
+      for (int i = 0; i < idx_num; ++i)
         {
-          fprintf(stderr, "Result verification failed at element %d!\n", i);
-          exit(0);
-          //exit(EXIT_FAILURE);
+          if (h_C[i] != h_A[i]*5+1)
+            {
+              fprintf(stdout, "Result verification first failed at element %d!\n", i);
+              break;
+              //exit(0);
+              //exit(EXIT_FAILURE);
+            }
         }
     }
 
-    printf("Test PASSED.\n");
-    return 0;
+    cudaCheckErrors(cudaFreeHost(h_A));
+    cudaCheckErrors(cudaFreeHost(h_B));
+    cudaCheckErrors(cudaFreeHost(h_C));
+    cudaCheckErrors(cudaFree(d_A));
+    cudaCheckErrors(cudaFree(d_B));
+    cudaCheckErrors(cudaFree(d_C));
+    //printf("Test PASSED.\n");
 }
 
+
+
+BENCHMARK_CAPTURE(benchmark_base, vectorGather, vectorGather, VERIFY)
+->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
+->Unit(benchmark::kMillisecond); 
+
+BENCHMARK_CAPTURE(benchmark_base, vectorCopy, vectorCopy, NO_VERIFY) // the dim table is irrelevant here
+->Args({1 << G, 4}) 
+->Unit(benchmark::kMillisecond); 
+
+BENCHMARK_MAIN();
