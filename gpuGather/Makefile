@@ -151,8 +151,8 @@ HOST_COMPILER ?= g++
 NVCC          := $(CUDA_PATH)/bin/nvcc -ccbin $(HOST_COMPILER)
 
 # internal flags
-NVCCFLAGS   := -m${TARGET_SIZE} -restrict
-CCFLAGS     := -Wall
+NVCCFLAGS   := -m${TARGET_SIZE} -restrict -g
+CCFLAGS     := -Wall -g
 LDFLAGS     :=
 
 # build flags
@@ -190,7 +190,7 @@ else
       BUILD_TYPE := release
 endif
 
-ALL_CCFLAGS := -std=c++11 
+ALL_CCFLAGS := -std=c++11 -Xptxas="-v"
 ALL_CCFLAGS += $(NVCCFLAGS)
 ALL_CCFLAGS += $(EXTRA_NVCCFLAGS)
 ALL_CCFLAGS += $(addprefix -Xcompiler ,$(CCFLAGS))
