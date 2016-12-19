@@ -164,7 +164,7 @@ templateKernel(const int * __restrict__ index_col,
           {
             auto num = xorshift_hash_dev(item);
             auto idx = num & mask;
-            assert(index_col[item] == idx);
+            //assert(index_col[item] == idx);
             tmp[g] = dimension_col[idx];
             break;
           }
@@ -200,13 +200,8 @@ templateKernel(const int * __restrict__ index_col,
           break;
         case Variant::NoMat:
           {
-            auto x = item;
-            auto a = x ^ (x >> 12); 
-            auto b = a ^ (a << 25);
-            auto c = b ^ (b >> 27);
-            
-            auto d  = ((unsigned int)c) * 213338717U;
-            auto idx = d & mask;
+            auto num = xorshift_hash_dev(item);
+            auto idx = num & mask;
             output[item] = dimension_col[idx];
             break;
           }
