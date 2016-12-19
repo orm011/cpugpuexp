@@ -419,73 +419,74 @@ void GPU_BM(benchmark::State& state)
 #define ATh(n) n
 #define ILP(n) (ILP::ilp##n)
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(4), TPB(256), ATh(32)) // actually does write output for now..
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(4), TPB(512), ATh(32)) // actually does write output for now..
 ->RangeMultiplier(2)
 ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
 ->Unit(benchmark::kMillisecond);
 
-
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(8), TPB(256), ATh(16)) // actually does write output for now..
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(2), TPB(512), ATh(32)) // actually does write output for now..
 ->RangeMultiplier(2)
 ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
 ->Unit(benchmark::kMillisecond);
 
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(8), TPB(256), ATh(16)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
+// ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(8)) // actually does write output for now..
-->RangeMultiplier(2)
-->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
-->Unit(benchmark::kMillisecond);
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(8)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
+// ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(4)) // actually does write output for now..
-->RangeMultiplier(2)
-->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
-->Unit(benchmark::kMillisecond);
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(4)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
+// ->Unit(benchmark::kMillisecond);
 
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(2)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
+// ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(2)) // actually does write output for now..
-->RangeMultiplier(2)
-->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(1)) // actually does write output for now..
-->RangeMultiplier(2)
-->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
-->Unit(benchmark::kMillisecond);
-
-
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(2), TPB(1024), ATh(32)) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(4), TPB(1024), ATh(32)) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(8), TPB(1024), ATh(32)) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(1024), ATh(32)) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(1)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
+// ->Unit(benchmark::kMillisecond);
 
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(8), TPB(512), ATh(32)) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
+// ->Args({1 << G, 1 << K})
+// ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(512), ATh(32)) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(2), TPB(1024), ATh(32)) // dim should be irrelevant
+// ->Args({1 << G, 1 << K})
+// ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(512), ATh(32)) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(4), TPB(1024), ATh(32)) // dim should be irrelevant
+// ->Args({1 << G, 1 << K})
+// ->Unit(benchmark::kMillisecond);
 
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(8), TPB(1024), ATh(32)) // dim should be irrelevant
+// ->Args({1 << G, 1 << K})
+// ->Unit(benchmark::kMillisecond);
+
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(1024), ATh(32)) // dim should be irrelevant
+// ->Args({1 << G, 1 << K})
+// ->Unit(benchmark::kMillisecond);
+
+
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(8), TPB(512), ATh(32)) // dim should be irrelevant
+// ->Args({1 << G, 1 << K})
+// ->Unit(benchmark::kMillisecond);
+
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(512), ATh(32)) // dim should be irrelevant
+// ->Args({1 << G, 1 << K})
+// ->Unit(benchmark::kMillisecond);
+
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(512), ATh(32)) // dim should be irrelevant
+// ->Args({1 << G, 1 << K})
+// ->Unit(benchmark::kMillisecond);
 
 BENCHMARK_TEMPLATE(GPU_BM, Variant::CudaMemcpy, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
 ->Args({1 << G, 1 << K})
