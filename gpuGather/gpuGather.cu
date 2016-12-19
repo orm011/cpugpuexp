@@ -33,11 +33,12 @@ using namespace std;
 // TODO: enable this in order to try mapped memory (vs streaming)
 // cudaSetDeviceFlags(cudaDeviceMapHost);
 // Print the vector length to be used, and compute its size
-const int G = 30;
-//const int M = 20;
-const int K = 10;
+constexpr int G = 30;
+constexpr int M = 20;
+constexpr int K = 10;
 
-const int kWarpSize = 32;
+constexpr int kWarpSize = 32;
+constexpr int kNumSM = 24; // gpu specific.
 
 inline int xorshift_hash(int x) {
     x ^= x >> 12; // a
@@ -68,106 +69,89 @@ inline int xorshift_hash(int x) {
 //     }
 // }
 
-enum Variant {
+enum struct Variant {
   Mat,
   NoMat,
   OnlyMat,
   NaiveMemcpy,
-  SingleThread,
   CudaMemcpy,
   CudaMemset,
   MAXVARIANT // do not use.
 };
 
-template <Variant variant, int GrainSize> __global__ void
+
+enum ILP {
+  ilp1 = 1,
+  ilp2 = 2,
+  ilp4 = 4,
+  ilp8 = 8,
+  ilp16 = 16,
+  ilp32 = 32,
+};
+
+
+struct ActiveThreads {
+private:
+  int val;
+
+public:
+  explicit ActiveThreads(int v) : val(v){}
+  operator int(){ return val; }
+};
+
+
+template <Variant variant, ILP ilp, int ActiveThreads> __global__ void
 templateKernel(const int * __restrict__ index_col,
                const int *__restrict__ dimension_col,
                int * __restrict__ output,
                int idx_len,
                int idx_domain)
 {
-  const auto tid = blockDim.x * blockIdx.x + threadIdx.x;
-  const auto offset = GrainSize*tid;
+  static_assert(ActiveThreads <= kWarpSize, "limit");
+  static_assert(ActiveThreads > 0, "limit");
+  static_assert((ActiveThreads - 1 & ActiveThreads) == 0, "power of 2"); // power of 2
+  constexpr uint32_t active_mask =  (uint32_t)(((1UL << ActiveThreads)) - 1);
+  
+  uint32_t lanebit = 0;
+  asm("mov.u32 %0, %lanemask_eq;" : "=r"(lanebit));
+  
+  // mapping block to data
+  constexpr int64_t warpFraction = kWarpSize / ActiveThreads;
+  int64_t blockSize = (ilp * blockDim.x)/warpFraction;
+  int64_t blockStart = blockSize * blockIdx.x;
+  int64_t blockEnd = blockStart + blockSize;
+
+  // mapping warp to data
+  constexpr int64_t dataPerWarp = ilp * ActiveThreads;
+  int64_t warpNo = threadIdx.x / kWarpSize;
+  int64_t warpOffset = blockStart + warpNo * dataPerWarp;
+
+  
+  if (lanebit & active_mask) {
+   const auto lane =  __ffs(lanebit) - 1;
+  const auto offset = warpOffset + lane;
   const auto unknown_variant = 0;
   const auto mask = idx_domain - 1;
-  
-  for (int g = 0; g < GrainSize; ++g){
-    auto item = offset + g*kWarpSize;
-    
-    if (item < idx_len)
-      {
 
-        switch(variant){
-        case NaiveMemcpy:
-          output[item] = index_col[item];
-          break;
-        case Mat:
-          output[item] = dimension_col[index_col[item]];
-          break;
-        case OnlyMat:
-          output[item] = 5*index_col[item] + 1;
-          break;
-        case NoMat:
-          {
-            auto x = item;
-            auto a = x ^ (x >> 12); 
-            auto b = a ^ (a << 25);
-            auto c = b ^ (b >> 27);
-            
-            auto d  = ((unsigned int)c) * 213338717U;
-            auto idx = d & mask;
-            output[item] = dimension_col[idx];
-            break;
-          }
-        default:
-          assert(unknown_variant);
-        }
-      }
-  }
-}
+  int tmp[ilp];
 
-template <Variant variant, int GrainSize> __global__ void
-templateKernelILP(const int * __restrict__ index_col,
-               const int *__restrict__ dimension_col,
-               int * __restrict__ output,
-               int idx_len,
-               int idx_domain)
-{
-  const auto tid = blockDim.x * blockIdx.x + threadIdx.x;
-  const auto offset = GrainSize*tid;
-  const auto unknown_variant = 0;
-  const auto mask = idx_domain - 1;
-  const int kCacheLine = 32;
-
-  struct cline {
-    long int line[kCacheLine/sizeof(long int)];
-  };
-  
   // most blocks.
-  if (((blockIdx.x + 1) * blockDim.x)*GrainSize < idx_len) {
-  int tmp[GrainSize];
-  cline lines[GrainSize];
+  if (blockEnd <= idx_len) {
     
   // load phase
-  for (int g = 0; g < GrainSize; ++g) {
-    auto item = offset + g*kWarpSize;
+  for (int g = 0; g < ilp; ++g) {
+    auto item = offset + g*ActiveThreads;
         switch(variant) {
-        case SingleThread: {
-          if (threadIdx.x == 0){
-            lines[g] = *(cline*)(&index_col[item]);
-          }
-          break;
-        }
-        case NaiveMemcpy:
+        case Variant::NaiveMemcpy:
           tmp[g] = index_col[item];
           break;
-        case Mat:
+        case Variant::Mat:
           tmp[g] = dimension_col[index_col[item]];
           break;
-        case OnlyMat:
+        case Variant::OnlyMat:
           tmp[g] = 5*index_col[item] + 1;
           break;
-        case NoMat:
+        case Variant::NoMat:
           {
             auto x = item;
             auto a = x ^ (x >> 12); 
@@ -184,39 +168,32 @@ templateKernelILP(const int * __restrict__ index_col,
         }
   }
     // use phase
-    for (int g = 0; g < GrainSize; ++g){
-      auto item = offset + g*kWarpSize;
+    for (int g = 0; g < ilp; ++g) {
+      auto item = offset + g*ActiveThreads;
       switch(variant){
-      case SingleThread:{
-        if (threadIdx.x == 0){
-          *((cline*)&output[item]) = lines[g];
-        }
-        break;
-      }
       default:
         output[item] = tmp[g];
       }
     }
 
-  } else {
-    for (int g = 0; g < GrainSize; ++g){
-    auto item = offset + g*kWarpSize;
+  } else { // used only for the last thread block.
+    for (int g = 0; g < ilp; ++g) {
+    auto item = offset + g*ActiveThreads;
     
     if (item < idx_len)
       {
 
         switch(variant){
-        case SingleThread:
-        case NaiveMemcpy:
+        case Variant::NaiveMemcpy:
           output[item] = index_col[item];
           break;
-        case Mat:
+        case Variant::Mat:
           output[item] = dimension_col[index_col[item]];
           break;
-        case OnlyMat:
+        case Variant::OnlyMat:
           output[item] = 5*index_col[item] + 1;
           break;
-        case NoMat:
+        case Variant::NoMat:
           {
             auto x = item;
             auto a = x ^ (x >> 12); 
@@ -235,11 +212,8 @@ templateKernelILP(const int * __restrict__ index_col,
   }
   }
 
-
+  }
 }
-
-
-
 
 
 #define cudaCheckErrors($call)                     \
@@ -263,10 +237,10 @@ templateKernelILP(const int * __restrict__ index_col,
 
 
 using KernelT = void(const int *, const int *, int *, int, int);
-template <Variant variant, int GrainSize, int ThreadsPerBlock>
+template <Variant variant, ILP ilp, int ThreadsPerBlock, int ActiveThreads>
 void GPU_BM(benchmark::State& state)
 {
-  static_assert(variant < MAXVARIANT, "invalid variant");
+  static_assert(int32_t(variant) < int32_t(Variant::MAXVARIANT), "invalid variant");
   //cerr << "running bench again" << endl;
   //printf("FYI:\ncuda cpuDeviceId: %d\n", cudaCpuDeviceId);
   int64_t idx_size = state.range(0);
@@ -322,41 +296,50 @@ void GPU_BM(benchmark::State& state)
     int *d_C = NULL;
     cudaCheckErrors(cudaMalloc((void **)&d_C, idx_size));
     
-    const int itemsPerBlock = ThreadsPerBlock*GrainSize;
-    const int blocksPerGrid = (idx_size + itemsPerBlock - 1) / itemsPerBlock;
+
+    int itemsPerBlock = -1;
+    int blocksPerGrid = -1;
     
     cudaCheckErrors(cudaMemcpy(d_B, h_B, dim_size, cudaMemcpyHostToDevice));
     cudaCheckErrors(cudaMemcpy(d_A, h_A, idx_size, cudaMemcpyHostToDevice));
 
     KernelT* kernel = nullptr;
     switch (variant){
-    case CudaMemcpy:
-    case CudaMemset:
+    case Variant::CudaMemcpy:
+    case Variant::CudaMemset:
       break;
-    default:
-      kernel=templateKernelILP<variant, GrainSize>;
-    }
+    default:{
+      kernel=templateKernel<variant, ilp, ActiveThreads>;
+      itemsPerBlock = (ilp * ThreadsPerBlock * ActiveThreads)/kWarpSize;
+      blocksPerGrid = (idx_size + itemsPerBlock - 1) / itemsPerBlock;
+      fprintf(stderr,
+              "Variant: %d\n"
+              "ILP: %d\n"
+              "Active threads per warp: %d\n"
+              "Threads per block: %d\n"
+              "Blocks per SM: %d\n"
+              "Remainder blocks: %d\n"
+              "Remainder threads: %d\n",
+              int(variant),
+              ilp,
+              ActiveThreads,
+              ThreadsPerBlock,
+              blocksPerGrid / kNumSM,
+              blocksPerGrid % kNumSM,
+              2048 % ThreadsPerBlock);
 
-    fprintf(stderr,
-            "Variant: %d.\n"
-            "Grain size: %d.\n"
-            "Threads per block: %d.\n"
-            "Blocks per SM: %d.\n"
-            "Remainder blocks: %d.\n"
-            "Remainder threads: %d.\n",
-            variant,
-            GrainSize,
-            ThreadsPerBlock,
-            blocksPerGrid / 24,
-            blocksPerGrid % 24,
-            2048 % ThreadsPerBlock);
+    }
+    }
+    
+
+    
 
     while (state.KeepRunning()){
         switch (variant) {
-        case CudaMemcpy:
+        case Variant::CudaMemcpy:
           cudaMemcpy(d_C, d_A, idx_size, cudaMemcpyDeviceToDevice);
           break;
-        case CudaMemset:
+        case Variant::CudaMemset:
           cudaMemset(d_C, 0xf, idx_size);
           break;
         default:
@@ -370,13 +353,12 @@ void GPU_BM(benchmark::State& state)
     state.SetItemsProcessed(int64_t(state.iterations())*int64_t(idx_num));
 
     switch(variant){
-    case CudaMemcpy:
-    case NaiveMemcpy:
-    case SingleThread:
+    case Variant::CudaMemcpy:
+    case Variant::NaiveMemcpy:
       state.SetBytesProcessed(int64_t(state.iterations())*
                               int64_t(idx_size * 2)); // read write
       break;
-    case CudaMemset:
+    case Variant::CudaMemset:
       state.SetBytesProcessed(int64_t(state.iterations())*
                               int64_t(idx_size)); // read write
       break;
@@ -391,37 +373,36 @@ void GPU_BM(benchmark::State& state)
 
     // Verify that the result vector is correct
     switch (variant){
-    case CudaMemcpy:
-    case NaiveMemcpy:
-    case SingleThread:
+    case Variant::CudaMemcpy:
+    case Variant::NaiveMemcpy:
       { 
-        for (int i = 0; i < idx_num; ++i){
+        for (int i = 0; i < idx_num; ++i) {
           if (h_C[i] != h_A[i]) {
-            state.SkipWithError("memcpy verification failed");
-            break;
+            fprintf(stderr, "ERROR. memcpy verification failed at position %d: h_C=%d but h_A=%d\n", i, h_C[i], h_A[i]);
+            break; // free memory
           }
         }
         break;
       }
-    case CudaMemset:
+    case Variant::CudaMemset:
       {
         for (int i = 0; i < idx_num; ++i){
           if (h_C[i] != 0x0f0f0f0f){
-            state.SkipWithError("memset verification failed");
-            break;
+            fprintf(stderr,  "ERROR. memset verification failed\n");
+            break; // free memory
           }
         }
         break;
       }
     default:
-      {
+      {// mbold red text
         for (int i = 0; i < idx_num; ++i) {
             if (h_C[i] != h_A[i]*5+1) {
-                state.SkipWithError("gather verification failed");
-                break;
+              fprintf(stderr, "\033[1;31mERROR.\033[0mgather verification failed at position %d: h_C=%d but h_A=%d and hA*5 + 1 = %d\n", i, h_C[i], h_A[i], h_A[i]*5+ 1);
+              break; // free memory
             }
         }
-        break;
+        break; 
       }
     }
 
@@ -434,57 +415,129 @@ void GPU_BM(benchmark::State& state)
     //printf("Test PASSED.\n");
 }
 
-#define TPB  (4*32*8)
-#define GRAIN_1 1
+#define TPB(n) n
+#define ATh(n) n
+#define ILP(n) (ILP::ilp##n)
 
-BENCHMARK_TEMPLATE(GPU_BM, Mat, GRAIN_1, TPB)
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(1), TPB(1024), ATh(32))
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
+// ->Unit(benchmark::kMillisecond); 
+
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(1), TPB(1024), ATh(32)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {32 << M, 256 << M}})
+// ->Unit(benchmark::kMillisecond);
+
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(2), TPB(1024), ATh(32)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {32 << M, 256 << M}})
+// ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(4), TPB(1024), ATh(32)) // actually does write output for now..
 ->RangeMultiplier(2)
-->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
-->Unit(benchmark::kMillisecond); 
+->Ranges({{1<<G, 1<<G}, {32 << M, 32 << M}})
+->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, NoMat, GRAIN_1, TPB) // actually does write output for now..
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(1), TPB(1024), ATh(8)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {32 << M, 32 << M}})
+// ->Unit(benchmark::kMillisecond);
+
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(2), TPB(1024), ATh(8)) // actually does write output for now..
+// ->RangeMultiplier(2)
+// ->Ranges({{1<<G, 1<<G}, {32 << M, 32 << M}})
+// ->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(4), TPB(1024), ATh(16)) // actually does write output for now..
 ->RangeMultiplier(2)
-->Ranges({{1<<G, 1<<G}, {1 << K, 1 << G}})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, OnlyMat, GRAIN_1, TPB)  // dim should be irrelevant
-->Args({1 << G, 1 <<K})->Args({1<<G, 1<<G})
-->Unit(benchmark::kMillisecond); 
-
-BENCHMARK_TEMPLATE(GPU_BM, NaiveMemcpy, 1, TPB) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, NaiveMemcpy, 2, TPB) // dim should be irrelevant
-->Args({1 << G, 1 << K})
+->Ranges({{1<<G, 1<<G}, {32 << M, 32 << M}})
 ->Unit(benchmark::kMillisecond);
 
 
-BENCHMARK_TEMPLATE(GPU_BM, NaiveMemcpy, 4, TPB) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, SingleThread, 1, TPB/2) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMillisecond);
-
-BENCHMARK_TEMPLATE(GPU_BM, SingleThread, 2, TPB/2) // dim should be irrelevant
-->Args({1 << G, 1 << K})
+BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(4), TPB(1024), ATh(8)) // actually does write output for now..
+->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {32 << M, 32 << M}})
 ->Unit(benchmark::kMillisecond);
 
 
-BENCHMARK_TEMPLATE(GPU_BM, SingleThread, 4, TPB/2) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(4), TPB(1024), ATh(4)) // actually does write output for now..
+->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {32 << M, 32 << M}})
+->Unit(benchmark::kMillisecond);
 
 
-BENCHMARK_TEMPLATE(GPU_BM, CudaMemcpy, GRAIN_1, TPB) // dim should be irrelevant
-->Args({1 << G, 1 << K})
-->Unit(benchmark::kMicrosecond);
+BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(4), TPB(1024), ATh(2)) // actually does write output for now..
+->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {32 << M, 32 << M}})
+->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, CudaMemset, GRAIN_1, TPB) // dim should be irrelevant
+BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(4), TPB(1024), ATh(1)) // actually does write output for now..
+->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {32 << M, 32 << M}})
+->Unit(benchmark::kMillisecond);
+
+
+// BENCHMARK_TEMPLATE(GPU_BM, Variant::OnlyMat, ILP(1), TPB(1024), ATh(32))  // dim should be irrelevant
+// ->Args({1 << G, 1 <<K})->Args({1<<G, 1<<G})
+// ->Unit(benchmark::kMillisecond); 
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
 ->Args({1 << G, 1 << K})
-->Unit(benchmark::kMicrosecond);
+->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(2), TPB(1024), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(4), TPB(1024), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(8), TPB(1024), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(1024), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(8), TPB(512), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(512), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(512), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(8), TPB(256), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(16), TPB(256), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(32), TPB(256), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::CudaMemcpy, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
+
+BENCHMARK_TEMPLATE(GPU_BM, Variant::CudaMemset, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
+->Args({1 << G, 1 << K})
+->Unit(benchmark::kMillisecond);
 
 
 BENCHMARK_MAIN();
