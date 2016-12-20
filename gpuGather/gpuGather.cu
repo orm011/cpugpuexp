@@ -81,11 +81,11 @@ enum struct Variant {
   NoMat,
   OnlyMat,
   NaiveMemcpy,
+  RandCheck, // if it has different performance to Mat, then the RNG is not good.
   CudaMemcpy,
   CudaMemset,
   MAXVARIANT // do not use.
 };
-
 
 enum ILP {
   ilp1 = 1,
@@ -99,17 +99,7 @@ enum ILP {
 };
 
 
-struct ActiveThreads {
-private:
-  int val;
-
-public:
-  explicit ActiveThreads(int v) : val(v){}
-  operator int(){ return val; }
-};
-
-
-template <Variant variant, ILP ilp, int ActiveThreads> __global__ void
+template <Variant variant, ILP ilp, int ActiveThreads, int GrainSize> __global__ void
 templateKernel(const int * __restrict__ index_col,
                const int *__restrict__ dimension_col,
                int * __restrict__ output,
@@ -126,12 +116,12 @@ templateKernel(const int * __restrict__ index_col,
   
   // mapping block to data
   constexpr int64_t warpFraction = kWarpSize / ActiveThreads;
-  int64_t blockSize = (ilp * blockDim.x)/warpFraction;
+  int64_t blockSize = (GrainSize * ilp * blockDim.x)/warpFraction;
   int64_t blockStart = blockSize * blockIdx.x;
   int64_t blockEnd = blockStart + blockSize;
 
   // mapping warp to data
-  constexpr int64_t dataPerWarp = ilp * ActiveThreads;
+  constexpr int64_t dataPerWarp = GrainSize * ilp * ActiveThreads;
   int64_t warpNo = threadIdx.x / kWarpSize;
   int64_t warpOffset = blockStart + warpNo * dataPerWarp;
 
@@ -140,48 +130,98 @@ templateKernel(const int * __restrict__ index_col,
   
   if (lanebit & active_mask) {
   const auto lane =  __ffs(lanebit) - 1;
-  const auto offset = warpOffset + lane;
+  const auto taskoffset = warpOffset + lane;
 
-  int tmp[ilp];
-
+  int tmp[ilp][3]; // wait until next one.
+  constexpr auto delta = ilp*ActiveThreads;
+  
   // most blocks.
   if (blockEnd <= idx_len) {
+
+    // init tmp.
+    for (int g = 0; g < ilp; ++g){
+      tmp[g][0] = index_col[taskoffset + g*ActiveThreads];
+      tmp[g][1] = index_col[taskoffset + g*ActiveThreads + delta];
+    }
     
+  for (int gs = 0; gs < GrainSize; ++gs){
+      auto offset = taskoffset + gs*delta;
+      auto this_slot = (gs % 3);
+      auto next_slot = (gs + 2) % 3;      
   // load phase
+
   for (int g = 0; g < ilp; ++g) {
     auto item = offset + g*ActiveThreads;
+
+    
         switch(variant) {
-        case Variant::NaiveMemcpy:
-          tmp[g] = index_col[item];
+        case Variant::NaiveMemcpy:{
+          // aka index_col[item + delta];
+          int ldd;
+          auto nextaddr = &index_col[item + 2*delta];
+          asm("ld.global.cs.u32 %0, [%1];" : "=r"(ldd) : "l"(nextaddr));
+          tmp[g][next_slot] = ldd; 
+          //auto nextaddr = &index_col[item + delta];
+          // prefetch next round
+          //asm("prefetch.global.L2 [%0];" :: "l"(nextaddr));
           break;
-        case Variant::Mat:
-          tmp[g] = dimension_col[index_col[item]];
+        }
+        case Variant::RandCheck:
+        case Variant::Mat:{
+          auto idx = index_col[item];
+          tmp[g][0] = idx;
+          //auto theaddr = &dimension_col[idx];
+          //asm("prefetch.local.L1 [%0];" :: "l"(theaddr));
           break;
+        }
         case Variant::OnlyMat:
-          tmp[g] = 5*index_col[item] + 1;
+          tmp[g][0] = 5*index_col[item] + 1;
           break;
         case Variant::NoMat:
           {
             auto num = xorshift_hash_dev(item);
-            auto idx = num & mask;
+            auto theidx = num & mask;
+            tmp[g][0] = theidx;
+            //asm("prefetchu.L1 [%0];" :: "l"(theaddr));
+
             //assert(index_col[item] == idx);
-            tmp[g] = dimension_col[idx];
             break;
           }
         default:
           assert(unknown_variant);
         }
   }
+
+  for (int g = 0; g < ilp; ++g){
+    switch(variant){
+    case Variant::NoMat:
+    case Variant::RandCheck:
+    case Variant::Mat:
+        tmp[g][1] = dimension_col[tmp[g][0]];
+        break;      
+    }
+  }
+  
     // use phase
     for (int g = 0; g < ilp; ++g) {
       auto item = offset + g*ActiveThreads;
       switch(variant){
+      case Variant::NoMat:
+      case Variant::RandCheck:
+      case Variant::Mat:
+        output[item] = tmp[g][1];
+        break;
       default:
-        output[item] = tmp[g];
+        output[item] = tmp[g][this_slot];
       }
     }
 
+    }
+
   } else { // used only for the last thread block.
+    //assert(0);
+    for (int gs = 0; gs < GrainSize; ++gs){
+      auto offset = taskoffset + gs*ilp*ActiveThreads;
     for (int g = 0; g < ilp; ++g) {
     auto item = offset + g*ActiveThreads;
     
@@ -192,6 +232,7 @@ templateKernel(const int * __restrict__ index_col,
         case Variant::NaiveMemcpy:
           output[item] = index_col[item];
           break;
+        case Variant::RandCheck:
         case Variant::Mat:
           output[item] = dimension_col[index_col[item]];
           break;
@@ -209,7 +250,8 @@ templateKernel(const int * __restrict__ index_col,
           assert(unknown_variant);
         }
       }
-  }
+     }
+    }
   }
 
   }
@@ -237,7 +279,7 @@ templateKernel(const int * __restrict__ index_col,
 
 
 using KernelT = void(const int *, const int *, int *, int, int);
-template <Variant variant, ILP ilp, int ThreadsPerBlock, int ActiveThreads>
+template <Variant variant, ILP ilp, int ThreadsPerBlock, int ActiveThreads, int GrainSize>
 void GPU_BM(benchmark::State& state)
 {
   static_assert(int32_t(variant) < int32_t(Variant::MAXVARIANT), "invalid variant");
@@ -276,8 +318,15 @@ void GPU_BM(benchmark::State& state)
     // Initialize the host input vectors
     for (int i = 0; i < idx_num; ++i)
     {
-       h_A[i] = xorshift_hash(i) & mask;
-       assert(h_A[i] < dim_num);
+      int rando = 0;
+      if (variant == Variant::RandCheck) {
+        auto rando = rand();
+      } else {
+        rando = xorshift_hash(i);
+      }
+      
+      h_A[i] = rando & mask;
+      assert(h_A[i] < dim_num);
     }
 
     for (int i = 0; i < dim_num; ++i){
@@ -295,7 +344,9 @@ void GPU_BM(benchmark::State& state)
     // Allocate the device output vector C
     int *d_C = NULL;
     cudaCheckErrors(cudaMalloc((void **)&d_C, idx_size));
-    
+    // init memory in device. to detect.
+    cudaCheckErrors(cudaMemset(d_C, 0xff, idx_size));
+
 
     int itemsPerBlock = -1;
     int blocksPerGrid = -1;
@@ -309,12 +360,15 @@ void GPU_BM(benchmark::State& state)
     case Variant::CudaMemset:
       break;
     default:{
-      kernel=templateKernel<variant, ilp, ActiveThreads>;
-      itemsPerBlock = (ilp * ThreadsPerBlock * ActiveThreads)/kWarpSize;
+      kernel=templateKernel<variant, ilp, ActiveThreads, GrainSize>;
+      auto threadMultiplier = kWarpSize/ActiveThreads;
+      itemsPerBlock = (ilp * GrainSize * ThreadsPerBlock)/threadMultiplier;
       blocksPerGrid = (idx_size + itemsPerBlock - 1) / itemsPerBlock;
       fprintf(stderr,
               "Variant: %d\n"
               "ILP: %d\n"
+              "Items per thread: %d\n"
+              "Items per block: %d\n"
               "Active threads per warp: %d\n"
               "Threads per block: %d\n"
               "Blocks per SM: %d\n"
@@ -322,6 +376,8 @@ void GPU_BM(benchmark::State& state)
               "Remainder threads: %d\n",
               int(variant),
               ilp,
+              GrainSize * ilp,
+              itemsPerBlock,
               ActiveThreads,
               ThreadsPerBlock,
               blocksPerGrid / kNumSM,
@@ -371,6 +427,7 @@ void GPU_BM(benchmark::State& state)
     cudaCheckErrors(cudaMallocHost(&h_C, idx_size));
     cudaCheckErrors(cudaMemcpy(h_C, d_C, idx_size, cudaMemcpyDeviceToHost));
 
+
     // Verify that the result vector is correct
     switch (variant){
     case Variant::CudaMemcpy:
@@ -378,7 +435,7 @@ void GPU_BM(benchmark::State& state)
       { 
         for (int i = 0; i < idx_num; ++i) {
           if (h_C[i] != h_A[i]) {
-            fprintf(stderr, "ERROR. memcpy verification failed at position %d: h_C=%d but h_A=%d\n", i, h_C[i], h_A[i]);
+            fprintf(stdout, "\033[1;31mERROR:\033[0m memcpy verification failed at position %d: h_C=%d but h_A=%d\n", i, h_C[i], h_A[i]);
             break; // free memory
           }
         }
@@ -388,7 +445,7 @@ void GPU_BM(benchmark::State& state)
       {
         for (int i = 0; i < idx_num; ++i){
           if (h_C[i] != 0x0f0f0f0f){
-            fprintf(stderr,  "ERROR. memset verification failed\n");
+            fprintf(stdout,  "ERROR. memset verification failed\n");
             break; // free memory
           }
         }
@@ -398,7 +455,7 @@ void GPU_BM(benchmark::State& state)
       {// mbold red text
         for (int i = 0; i < idx_num; ++i) {
             if (h_C[i] != h_A[i]*5+1) {
-              fprintf(stderr, "\033[1;31mERROR.\033[0mgather verification failed at position %d: h_C=%d but h_A=%d and hA*5 + 1 = %d\n", i, h_C[i], h_A[i], h_A[i]*5+ 1);
+              fprintf(stdout, "\033[1;31mERROR:\033[0m gather verification failed at position %d: h_C=%d but h_A=%d and hA*5 + 1 = %d\n", i, h_C[i], h_A[i], h_A[i]*5+ 1);
               break; // free memory
             }
         }
@@ -418,15 +475,16 @@ void GPU_BM(benchmark::State& state)
 #define TPB(n) n
 #define ATh(n) n
 #define ILP(n) (ILP::ilp##n)
+#define GS(n) n
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(4), TPB(512), ATh(32)) // actually does write output for now..
-->RangeMultiplier(2)
-->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(2), TPB(256), ATh(32), GS(8)) // actually does write output for now..
+->RangeMultiplier(8)
+->Ranges({{1<<G, 1<<G}, {64 << M,  64 << M}})
 ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(2), TPB(512), ATh(32)) // actually does write output for now..
+BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(4), TPB(256), ATh(32), GS(4)) // actually does write output for now..
 ->RangeMultiplier(2)
-->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
+->Ranges({{1<<G, 1<<G}, {64 << M, 64 << M}})
 ->Unit(benchmark::kMillisecond);
 
 // BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(8), TPB(256), ATh(16)) // actually does write output for now..
@@ -449,10 +507,10 @@ BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(2), TPB(512), ATh(32)) // a
 // ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
 // ->Unit(benchmark::kMillisecond);
 
-// BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(16), TPB(256), ATh(1)) // actually does write output for now..
-// ->RangeMultiplier(2)
-// ->Ranges({{1<<G, 1<<G}, {256 << M, 256 << M}})
-// ->Unit(benchmark::kMillisecond);
+BENCHMARK_TEMPLATE(GPU_BM, Variant::Mat, ILP(2), TPB(256), ATh(32), GS(2)) // actually does write output for now..
+->RangeMultiplier(2)
+->Ranges({{1<<G, 1<<G}, {1 << K, 512 << M}})
+->Unit(benchmark::kMillisecond);
 
 
 // BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
@@ -488,11 +546,11 @@ BENCHMARK_TEMPLATE(GPU_BM, Variant::NaiveMemcpy, ILP(2), TPB(512), ATh(32)) // a
 // ->Args({1 << G, 1 << K})
 // ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::CudaMemcpy, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
+BENCHMARK_TEMPLATE(GPU_BM, Variant::CudaMemcpy, ILP(1), TPB(1024), ATh(32) ,GS(1)) // dim should be irrelevant
 ->Args({1 << G, 1 << K})
 ->Unit(benchmark::kMillisecond);
 
-BENCHMARK_TEMPLATE(GPU_BM, Variant::CudaMemset, ILP(1), TPB(1024), ATh(32)) // dim should be irrelevant
+BENCHMARK_TEMPLATE(GPU_BM, Variant::CudaMemset, ILP(1), TPB(1024), ATh(32), GS(1)) // dim should be irrelevant
 ->Args({1 << G, 1 << K})
 ->Unit(benchmark::kMillisecond);
 
