@@ -1,22 +1,3 @@
-/**
- * Copyright 1993-2015 NVIDIA Corporation.  All rights reserved.
- *
- * Please refer to the NVIDIA end user license agreement (EULA) associated
- * with this source code for terms and conditions that govern your use of
- * this software. Any use, reproduction, disclosure, or distribution of
- * this software and related documentation outside the terms of the EULA
- * is strictly prohibited.
- *
- */
-
-/**
- * Vector addition: C = A + B.
- *
- * This sample is a very basic sample that implements element by element
- * vector addition. It is the same as the sample illustrating Chapter 2
- * of the programming guide with some additions like error checking.
- */
-
 #include <stdio.h>
 #include <benchmark/benchmark.h>
 
@@ -40,18 +21,11 @@ constexpr int K = 10;
 constexpr int kWarpSize = 32;
 constexpr int kNumSM = 24; // gpu specific.
 
-inline int xorshift_hash(int x) {
-    x ^= x >> 12; // a
-    x ^= x << 25; // b
-    x ^= x >> 27; // c
-    return ((unsigned int)x) * 213338717U;
-}
-
-__device__ int xorshift_hash_dev(int x) {
-    x ^= x >> 12; // a
-    x ^= x << 25; // b
-    x ^= x >> 27; // c
-    return ((unsigned int)x) * 213338717U;
+__host__ __device__ inline int xorshift_hash(int x) {
+  x ^= x >> 12; // a
+  x ^= x << 25; // b
+  x ^= x >> 27; // c
+  return ((unsigned int)x) * 213338717U;
 }
 
 
@@ -87,6 +61,7 @@ enum struct Variant {
   MAXVARIANT // do not use.
 };
 
+// how many outstanding requests (concurrent) in ad.
 enum ILP {
   ilp1 = 1,
   ilp2 = 2,
@@ -98,8 +73,25 @@ enum ILP {
   ilp128 = 128,
 };
 
+enum ActiveLanes {
+  al1 = 1,
+  al2 = 2,
+  al4 = 4,
+  al8 = 8,
+  al16 = 16,
+  al32 = 32
+};
 
-template <Variant variant, ILP ilp, int ActiveThreads, int GrainSize> __global__ void
+// how many tasks of size ILP will be executed in series.
+enum GrainSize {
+  gs1 = 1,
+  gs2 = 2,
+  gs3 = 3,
+  gs4 = 4,
+  gs8 = 8
+};
+
+template <Variant variant, ILP ilp, ActiveLanes ActiveThreads, GrainSize gs> __global__ void
 templateKernel(const int * __restrict__ index_col,
                const int *__restrict__ dimension_col,
                int * __restrict__ output,
@@ -116,12 +108,12 @@ templateKernel(const int * __restrict__ index_col,
   
   // mapping block to data
   constexpr int64_t warpFraction = kWarpSize / ActiveThreads;
-  int64_t blockSize = (GrainSize * ilp * blockDim.x)/warpFraction;
+  int64_t blockSize = (gs * ilp * blockDim.x)/warpFraction;
   int64_t blockStart = blockSize * blockIdx.x;
   int64_t blockEnd = blockStart + blockSize;
 
   // mapping warp to data
-  constexpr int64_t dataPerWarp = GrainSize * ilp * ActiveThreads;
+  constexpr int64_t dataPerWarp = gs * ilp * ActiveThreads;
   int64_t warpNo = threadIdx.x / kWarpSize;
   int64_t warpOffset = blockStart + warpNo * dataPerWarp;
 
@@ -137,17 +129,18 @@ templateKernel(const int * __restrict__ index_col,
   
   // most blocks.
   if (blockEnd <= idx_len) {
-
+    if (variant == Variant::NaiveMemcpy){
     // init tmp.
     for (int g = 0; g < ilp; ++g){
       tmp[g][0] = index_col[taskoffset + g*ActiveThreads];
       tmp[g][1] = index_col[taskoffset + g*ActiveThreads + delta];
     }
+    }
     
-  for (int gs = 0; gs < GrainSize; ++gs){
-      auto offset = taskoffset + gs*delta;
-      auto this_slot = (gs % 3);
-      auto next_slot = (gs + 2) % 3;      
+  for (int iter = 0; iter < gs; ++iter){
+      auto offset = taskoffset + iter*delta;
+      auto this_slot = (iter % 3);
+      auto next_slot = (iter + 2) % 3;      
   // load phase
 
   for (int g = 0; g < ilp; ++g) {
@@ -179,7 +172,7 @@ templateKernel(const int * __restrict__ index_col,
           break;
         case Variant::NoMat:
           {
-            auto num = xorshift_hash_dev(item);
+            auto num = xorshift_hash(item);
             auto theidx = num & mask;
             tmp[g][0] = theidx;
             //asm("prefetchu.L1 [%0];" :: "l"(theaddr));
@@ -197,19 +190,25 @@ templateKernel(const int * __restrict__ index_col,
     case Variant::NoMat:
     case Variant::RandCheck:
     case Variant::Mat:
-        tmp[g][1] = dimension_col[tmp[g][0]];
-        break;      
+      int val;
+      auto addr  = &dimension_col[tmp[g][0]];
+      asm("ld.global.cs.s32 %0, [%1];" : "=r"(val) : "l"(addr));
+      tmp[g][1] = val;
+      break;      
     }
   }
   
     // use phase
     for (int g = 0; g < ilp; ++g) {
       auto item = offset + g*ActiveThreads;
+
       switch(variant){
       case Variant::NoMat:
       case Variant::RandCheck:
       case Variant::Mat:
         output[item] = tmp[g][1];
+        //auto outaddr = &output[item];
+        //asm("st.global.cs.s32 [%0], %1;": "=l"(outaddr) , "r"(tmp[g][1]));
         break;
       default:
         output[item] = tmp[g][this_slot];
@@ -220,8 +219,8 @@ templateKernel(const int * __restrict__ index_col,
 
   } else { // used only for the last thread block.
     //assert(0);
-    for (int gs = 0; gs < GrainSize; ++gs){
-      auto offset = taskoffset + gs*ilp*ActiveThreads;
+    for (int iter = 0; iter < gs; ++iter){
+      auto offset = taskoffset + iter*ilp*ActiveThreads;
     for (int g = 0; g < ilp; ++g) {
     auto item = offset + g*ActiveThreads;
     
@@ -241,7 +240,7 @@ templateKernel(const int * __restrict__ index_col,
           break;
         case Variant::NoMat:
           {
-            auto num = xorshift_hash_dev(item);
+            auto num = xorshift_hash(item);
             auto idx = num & mask;
             output[item] = dimension_col[idx];
             break;
@@ -279,7 +278,7 @@ templateKernel(const int * __restrict__ index_col,
 
 
 using KernelT = void(const int *, const int *, int *, int, int);
-template <Variant variant, ILP ilp, int ThreadsPerBlock, int ActiveThreads, int GrainSize>
+template <Variant variant, ILP ilp, int ThreadsPerBlock, ActiveLanes ActiveThreads, GrainSize gs>
 void GPU_BM(benchmark::State& state)
 {
   static_assert(int32_t(variant) < int32_t(Variant::MAXVARIANT), "invalid variant");
@@ -360,9 +359,9 @@ void GPU_BM(benchmark::State& state)
     case Variant::CudaMemset:
       break;
     default:{
-      kernel=templateKernel<variant, ilp, ActiveThreads, GrainSize>;
+      kernel=templateKernel<variant, ilp, ActiveThreads, gs>;
       auto threadMultiplier = kWarpSize/ActiveThreads;
-      itemsPerBlock = (ilp * GrainSize * ThreadsPerBlock)/threadMultiplier;
+      itemsPerBlock = (ilp * gs * ThreadsPerBlock)/threadMultiplier;
       blocksPerGrid = (idx_size + itemsPerBlock - 1) / itemsPerBlock;
       fprintf(stderr,
               "Variant: %d\n"
@@ -376,7 +375,7 @@ void GPU_BM(benchmark::State& state)
               "Remainder threads: %d\n",
               int(variant),
               ilp,
-              GrainSize * ilp,
+              gs * ilp,
               itemsPerBlock,
               ActiveThreads,
               ThreadsPerBlock,
@@ -473,9 +472,9 @@ void GPU_BM(benchmark::State& state)
 }
 
 #define TPB(n) n
-#define ATh(n) n
+#define ATh(n) ActiveLanes::al##n
 #define ILP(n) (ILP::ilp##n)
-#define GS(n) n
+#define GS(n) GrainSize::gs##n
 
 BENCHMARK_TEMPLATE(GPU_BM, Variant::NoMat, ILP(2), TPB(256), ATh(32), GS(8)) // actually does write output for now..
 ->RangeMultiplier(8)
