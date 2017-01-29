@@ -55,6 +55,7 @@ enum struct Variant {
   NoMat,
   OnlyMat,
   NaiveMemcpy,
+  StreamMemcpy,
   RandCheck, // if it has different performance to Mat, then the RNG is not good.
   CudaMemcpy,
   CudaMemset,
@@ -91,7 +92,17 @@ enum GrainSize {
   gs8 = 8
 };
 
-template <Variant variant, ILP ilp, ActiveLanes ActiveThreads, GrainSize gs> __global__ void
+// returns a 1-hot of the current lane.
+__device__ inline int get_lane(){
+  return threadIdx.x % 32;
+  // int lanebit = 0;
+  // asm("mov.u32 %0, %lanemask_eq;" : "=r"(lanebit));
+  // const auto lane =  __ffs(lanebit) - 1;
+  // return lane;
+}
+
+template <Variant variant, ILP ilp, ActiveLanes ActiveThreads, GrainSize gs>
+__global__ void
 templateKernel(const int * __restrict__ index_col,
                const int *__restrict__ dimension_col,
                int * __restrict__ output,
@@ -101,10 +112,6 @@ templateKernel(const int * __restrict__ index_col,
   static_assert(ActiveThreads <= kWarpSize, "limit");
   static_assert(ActiveThreads > 0, "limit");
   static_assert((ActiveThreads - 1 & ActiveThreads) == 0, "power of 2"); // power of 2
-  constexpr uint32_t active_mask =  (uint32_t)(((1UL << ActiveThreads)) - 1);
-  
-  uint32_t lanebit = 0;
-  asm("mov.u32 %0, %lanemask_eq;" : "=r"(lanebit));
   
   // mapping block to data
   constexpr int64_t warpFraction = kWarpSize / ActiveThreads;
@@ -119,32 +126,32 @@ templateKernel(const int * __restrict__ index_col,
 
   const auto unknown_variant = 0;
   const auto mask = idx_domain - 1;
+  auto lane = get_lane();
   
-  if (lanebit & active_mask) {
-  const auto lane =  __ffs(lanebit) - 1;
-  const auto taskoffset = warpOffset + lane;
+  if (lane < ActiveThreads) {
+    const auto taskoffset = warpOffset + lane;
+  
+    // // most blocks.
+    if (blockEnd <= idx_len) {
+    //   if (variant == Variant::NaiveMemcpy){
+    //   // init tmp.
+    //   for (int g = 0; g < ilp; ++g){
+    //     tmp[g][0] = index_col[taskoffset + g*ActiveThreads];
+    //     tmp[g][1] = index_col[taskoffset + g*ActiveThreads + delta];
+    //   }
+    //   }
+    int tmp[ilp]; // wait until next one.
+    constexpr auto delta = ilp*ActiveThreads;
 
-  int tmp[ilp][3]; // wait until next one.
-  constexpr auto delta = ilp*ActiveThreads;
-  
-  // most blocks.
-  if (blockEnd <= idx_len) {
-    if (variant == Variant::NaiveMemcpy){
-    // init tmp.
-    for (int g = 0; g < ilp; ++g){
-      tmp[g][0] = index_col[taskoffset + g*ActiveThreads];
-      tmp[g][1] = index_col[taskoffset + g*ActiveThreads + delta];
-    }
-    }
     
-  for (int iter = 0; iter < gs; ++iter){
+    for (int iter = 0; iter < gs; ++iter){
       auto offset = taskoffset + iter*delta;
-      auto this_slot = (iter % 3);
-      auto next_slot = (iter + 2) % 3;      
-  // load phase
+      //auto this_slot = (iter % 3);
+      //auto next_slot = (iter + 2) % 3;      
+      // load phase
 
-  for (int g = 0; g < ilp; ++g) {
-    auto item = offset + g*ActiveThreads;
+      for (int g = 0; g < ilp; ++g) {
+        auto item = offset + g*ActiveThreads;
 
     
         switch(variant) {
@@ -153,7 +160,7 @@ templateKernel(const int * __restrict__ index_col,
           int ldd;
           auto nextaddr = &index_col[item + 2*delta];
           asm("ld.global.cs.u32 %0, [%1];" : "=r"(ldd) : "l"(nextaddr));
-          tmp[g][next_slot] = ldd; 
+          tmp[g] = ldd; 
           //auto nextaddr = &index_col[item + delta];
           // prefetch next round
           //asm("prefetch.global.L2 [%0];" :: "l"(nextaddr));
@@ -162,19 +169,19 @@ templateKernel(const int * __restrict__ index_col,
         case Variant::RandCheck:
         case Variant::Mat:{
           auto idx = index_col[item];
-          tmp[g][0] = idx;
+          tmp[g] = idx;
           //auto theaddr = &dimension_col[idx];
           //asm("prefetch.local.L1 [%0];" :: "l"(theaddr));
           break;
         }
         case Variant::OnlyMat:
-          tmp[g][0] = 5*index_col[item] + 1;
+          tmp[g] = 5*index_col[item] + 1;
           break;
         case Variant::NoMat:
           {
             auto num = xorshift_hash(item);
             auto theidx = num & mask;
-            tmp[g][0] = theidx;
+            tmp[g] = theidx;
             //asm("prefetchu.L1 [%0];" :: "l"(theaddr));
 
             //assert(index_col[item] == idx);
@@ -183,37 +190,37 @@ templateKernel(const int * __restrict__ index_col,
         default:
           assert(unknown_variant);
         }
-  }
-
-  for (int g = 0; g < ilp; ++g){
-    switch(variant){
-    case Variant::NoMat:
-    case Variant::RandCheck:
-    case Variant::Mat:
-      int val;
-      auto addr  = &dimension_col[tmp[g][0]];
-      asm("ld.global.cs.s32 %0, [%1];" : "=r"(val) : "l"(addr));
-      tmp[g][1] = val;
-      break;      
-    }
-  }
-  
-    // use phase
-    for (int g = 0; g < ilp; ++g) {
-      auto item = offset + g*ActiveThreads;
-
-      switch(variant){
-      case Variant::NoMat:
-      case Variant::RandCheck:
-      case Variant::Mat:
-        output[item] = tmp[g][1];
-        //auto outaddr = &output[item];
-        //asm("st.global.cs.s32 [%0], %1;": "=l"(outaddr) , "r"(tmp[g][1]));
-        break;
-      default:
-        output[item] = tmp[g][this_slot];
       }
-    }
+
+      for (int g = 0; g < ilp; ++g){
+        switch(variant){
+        case Variant::NoMat:
+        case Variant::RandCheck:
+        case Variant::Mat:
+          int val;
+          auto addr  = &dimension_col[tmp[g]];
+          asm("ld.global.cs.s32 %0, [%1];" : "=r"(val) : "l"(addr));
+          tmp[g] = val;
+          break;      
+        }
+      }
+  
+      // use phase
+      for (int g = 0; g < ilp; ++g) {
+        auto item = offset + g*ActiveThreads;
+
+        switch(variant){
+        case Variant::NoMat:
+        case Variant::RandCheck:
+        case Variant::Mat:
+          output[item] = tmp[g];
+          //auto outaddr = &output[item];
+          //asm("st.global.cs.s32 [%0], %1;": "=l"(outaddr) , "r"(tmp[g][1]));
+          break;
+        default:
+          output[item] = tmp[g];
+        }
+      }
 
     }
 
@@ -221,39 +228,39 @@ templateKernel(const int * __restrict__ index_col,
     //assert(0);
     for (int iter = 0; iter < gs; ++iter){
       auto offset = taskoffset + iter*ilp*ActiveThreads;
-    for (int g = 0; g < ilp; ++g) {
-    auto item = offset + g*ActiveThreads;
+      for (int g = 0; g < ilp; ++g) {
+        auto item = offset + g*ActiveThreads;
     
-    if (item < idx_len)
-      {
-
-        switch(variant){
-        case Variant::NaiveMemcpy:
-          output[item] = index_col[item];
-          break;
-        case Variant::RandCheck:
-        case Variant::Mat:
-          output[item] = dimension_col[index_col[item]];
-          break;
-        case Variant::OnlyMat:
-          output[item] = 5*index_col[item] + 1;
-          break;
-        case Variant::NoMat:
+        if (item < idx_len)
           {
-            auto num = xorshift_hash(item);
-            auto idx = num & mask;
-            output[item] = dimension_col[idx];
-            break;
+
+            switch(variant){
+            case Variant::NaiveMemcpy:
+              output[item] = index_col[item];
+              break;
+            case Variant::RandCheck:
+            case Variant::Mat:
+              output[item] = dimension_col[index_col[item]];
+              break;
+            case Variant::OnlyMat:
+              output[item] = 5*index_col[item] + 1;
+              break;
+            case Variant::NoMat:
+              {
+                auto num = xorshift_hash(item);
+                auto idx = num & mask;
+                output[item] = dimension_col[idx];
+                break;
+              }
+            default:
+              assert(unknown_variant);
+            }
           }
-        default:
-          assert(unknown_variant);
-        }
       }
-     }
     }
   }
 
-  }
+}
 }
 
 
